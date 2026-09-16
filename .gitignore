@@ -8,6 +8,7 @@ logs/
 data/
 build/
 dist/
+pw-browsers/
 *.db
 *.db-journal
 *.spec.bak
