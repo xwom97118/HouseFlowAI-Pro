@@ -56,6 +56,21 @@ if not exist "app\widgets\property_picker.py" (
     goto :failed
 )
 
+if not exist "app\pages\sync_center.py" (
+    echo ERROR: app\pages\sync_center.py is missing.
+    goto :failed
+)
+
+if not exist "app\services\sync_runner.py" (
+    echo ERROR: app\services\sync_runner.py is missing.
+    goto :failed
+)
+
+if not exist "app\services\browser_runtime.py" (
+    echo ERROR: app\services\browser_runtime.py is missing.
+    goto :failed
+)
+
 if not exist "houseflow_version_info.txt" (
     echo ERROR: houseflow_version_info.txt is missing.
     goto :failed
@@ -69,9 +84,15 @@ echo [3/8] Installing project requirements...
 python -m pip install -r requirements.txt >> "%BUILD_LOG%" 2>&1
 if errorlevel 1 goto :failed
 
-echo [4/8] Installing Playwright Chromium...
+echo [4/8] Installing Playwright Chromium into local bundle folder...
+set "PLAYWRIGHT_BROWSERS_PATH=%CD%\pw-browsers"
 python -m playwright install chromium >> "%BUILD_LOG%" 2>&1
 if errorlevel 1 goto :failed
+
+if not exist "pw-browsers" (
+    echo ERROR: pw-browsers folder was not created by playwright install.
+    goto :failed
+)
 
 echo [5/8] Backing up desktop data...
 set "DESKTOP=%USERPROFILE%\Desktop"
@@ -113,14 +134,18 @@ python -m PyInstaller ^
   --hidden-import "app.pages.strategy" ^
   --hidden-import "app.services.database" ^
   --hidden-import "app.services.sync_service" ^
+  --hidden-import "app.services.sync_runner" ^
+  --hidden-import "app.services.browser_runtime" ^
   --hidden-import "app.services.facebook_service" ^
   --hidden-import "app.services.copywriting_engine" ^
   --hidden-import "app.services.universal_import_service" ^
+  --hidden-import "app.pages.sync_center" ^
   --hidden-import "app.widgets.common" ^
   --hidden-import "app.widgets.property_picker" ^
   --hidden-import "app.widgets.universal_import_dialog" ^
   --add-data "app;app" ^
   --add-data "data;data" ^
+  --add-data "pw-browsers;pw-browsers" ^
   "main.py" >> "%BUILD_LOG%" 2>&1
 
 if errorlevel 1 goto :failed

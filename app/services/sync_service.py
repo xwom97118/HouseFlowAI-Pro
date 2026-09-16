@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlparse
@@ -29,6 +29,13 @@ class SyncResult:
     saved: int
     properties: list[dict]
     message: str
+    failed_pages: list[int] = field(default_factory=list)
+    duration_seconds: int = 0
+    cancelled: bool = False
+
+    @property
+    def had_failures(self) -> bool:
+        return bool(self.failed_pages) or self.cancelled
 
 
 
@@ -185,6 +192,7 @@ class YungchingSyncService:
         self,
         source_url: str,
         progress_callback: Callable[[dict], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> SyncResult:
         started_at = time.perf_counter()
         source_url = source_url.strip()
@@ -218,7 +226,13 @@ class YungchingSyncService:
         seen: set[str] = set()
         failed_pages: list[int] = []
 
+        cancelled = False
+
         for page_number in range(1, total_pages + 1):
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                break
+
             self._notify(
                 progress_callback,
                 stage="pages",
@@ -285,6 +299,10 @@ class YungchingSyncService:
 
         total_properties = len(all_properties)
         completed_count = 0
+
+        if cancelled:
+            all_properties = []
+            total_properties = 0
 
         with ThreadPoolExecutor(
             max_workers=self.PROPERTY_WORKERS
@@ -377,11 +395,17 @@ class YungchingSyncService:
                 f"{failed_image_properties} 筆照片同步失敗"
             )
 
+        if cancelled:
+            message_parts.append("同步已由使用者取消")
+
         return SyncResult(
             found=len(all_properties),
             saved=0,
             properties=all_properties,
             message="，".join(message_parts) + "。",
+            failed_pages=failed_pages,
+            duration_seconds=elapsed_seconds,
+            cancelled=cancelled,
         )
 
     def _detect_total_pages(
@@ -503,6 +527,7 @@ class YungchingSyncService:
                     "size": self._extract_size(combined),
                     "url": full_url,
                     "status": "active",
+                    "source_site": "yungching",
                 }
             )
 

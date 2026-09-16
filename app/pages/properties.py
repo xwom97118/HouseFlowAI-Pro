@@ -6,7 +6,6 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QHBoxLayout,
     QInputDialog,
@@ -21,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.database import Database
-from app.services.sync_service import YungchingSyncService
+from app.services.sync_runner import SyncRunner
 from app.widgets.common import SectionTitle
 from app.widgets.universal_import_dialog import UniversalImportDialog
 
@@ -42,7 +41,7 @@ class PropertiesPage(QWidget):
         self.db = db
         self.open_ai = open_ai
         self.go_dashboard = go_dashboard
-        self.sync_service = YungchingSyncService()
+        self.runner: SyncRunner | None = None
         self.rows: list[dict] = []
 
         root = QVBoxLayout(self)
@@ -221,6 +220,9 @@ class PropertiesPage(QWidget):
         self.status_label.setText(f"已儲存標籤與備註：{row.get('title', '')}")
 
     def sync_properties(self) -> None:
+        if self.runner is not None:
+            QMessageBox.information(self, "同步進行中", "目前已有同步正在執行，請稍候。")
+            return
         source_url = self.source_url.text().strip()
         if not source_url:
             QMessageBox.warning(self, "缺少網址", "請先輸入永慶或台慶店頭物件列表網址；若要匯入其他公司的單一物件，請按「匯入單一物件網址」。")
@@ -228,24 +230,42 @@ class PropertiesPage(QWidget):
         self.db.set_setting("property_source_url", source_url)
         self.sync_button.setEnabled(False)
         self.sync_button.setText("同步中…")
-        self.status_label.setText("正在讀取網站，請稍候…")
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        QApplication.processEvents()
-        try:
-            result = self.sync_service.fetch(source_url)
-            saved = self.db.upsert_properties(result.properties, source_url)
-            self.refresh()
-            QMessageBox.information(
-                self, "同步完成",
-                f"網站找到：{result.found} 筆\n儲存或更新：{saved} 筆\n\n收藏、標籤與備註不會被覆蓋。",
-            )
-        except Exception as exc:
-            self.status_label.setText("同步失敗，請檢查網址或網路。")
-            QMessageBox.critical(self, "同步失敗", f"無法同步物件。\n\n錯誤內容：{exc}")
-        finally:
-            QApplication.restoreOverrideCursor()
-            self.sync_button.setEnabled(True)
-            self.sync_button.setText("同步整店物件")
+        self.status_label.setText("正在讀取網站，請稍候…（不會卡住畫面，可切換到其他頁面）")
+
+        self.runner = SyncRunner(self.db, {"id": None, "url": source_url, "name": "物件中心手動同步"})
+        self.runner.progress.connect(self._on_sync_progress)
+        self.runner.finished.connect(self._on_sync_finished)
+        self.runner.failed.connect(self._on_sync_failed)
+        self.runner.start()
+
+    def _on_sync_progress(self, payload: dict) -> None:
+        message = str(payload.get("message", ""))
+        if message:
+            self.status_label.setText(message)
+
+    def _on_sync_finished(self, payload: dict) -> None:
+        counts = payload.get("counts", {})
+        found = payload.get("found", 0)
+        self.refresh()
+        self._reset_sync_button()
+        QMessageBox.information(
+            self, "同步完成",
+            f"網站找到：{found} 筆\n"
+            f"新增：{counts.get('new', 0)}，更新：{counts.get('updated', 0)}，"
+            f"價格異動：{counts.get('price_changed', 0)}\n\n收藏、標籤與備註不會被覆蓋。",
+        )
+
+    def _on_sync_failed(self, message: str) -> None:
+        self.status_label.setText("同步失敗，請檢查網址或網路。")
+        self._reset_sync_button()
+        QMessageBox.critical(self, "同步失敗", f"無法同步物件。\n\n錯誤內容：{message}")
+
+    def _reset_sync_button(self) -> None:
+        if self.runner is not None:
+            self.runner.wait_and_cleanup()
+        self.runner = None
+        self.sync_button.setEnabled(True)
+        self.sync_button.setText("同步整店物件")
 
     def open_universal_import(self) -> None:
         dialog = UniversalImportDialog(

@@ -36,6 +36,9 @@ class Database:
             self._ensure_property_columns(conn)
             conn.executescript(
                 """
+                CREATE INDEX IF NOT EXISTS idx_properties_source_id
+                ON properties(source_id);
+
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_properties_external_id
                 ON properties(external_id)
                 WHERE external_id IS NOT NULL AND external_id != '';
@@ -93,6 +96,56 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
+
+                CREATE TABLE IF NOT EXISTS sync_sources (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    source_type TEXT NOT NULL DEFAULT 'yungching_store',
+                    url TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    auto_sync_enabled INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    last_sync_at TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS sync_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_id INTEGER,
+                    source_url TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'running',
+                    found_count INTEGER NOT NULL DEFAULT 0,
+                    new_count INTEGER NOT NULL DEFAULT 0,
+                    updated_count INTEGER NOT NULL DEFAULT 0,
+                    offline_count INTEGER NOT NULL DEFAULT 0,
+                    failed_count INTEGER NOT NULL DEFAULT 0,
+                    duration_seconds INTEGER NOT NULL DEFAULT 0,
+                    error_message TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(source_id) REFERENCES sync_sources(id) ON DELETE SET NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS property_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    property_id INTEGER NOT NULL,
+                    change_type TEXT NOT NULL,
+                    old_value TEXT NOT NULL DEFAULT '',
+                    new_value TEXT NOT NULL DEFAULT '',
+                    detected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    sync_run_id INTEGER,
+                    FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE CASCADE,
+                    FOREIGN KEY(sync_run_id) REFERENCES sync_runs(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_property_changes_property
+                ON property_changes(property_id);
+
+                CREATE INDEX IF NOT EXISTS idx_property_changes_run
+                ON property_changes(sync_run_id);
+
+                CREATE INDEX IF NOT EXISTS idx_sync_runs_source
+                ON sync_runs(source_id);
                 """
             )
             self.set_default_setting(conn, "ai_enabled", "0")
@@ -120,6 +173,12 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             "updated_at": "TEXT NOT NULL DEFAULT ''",
             "image_paths": "TEXT NOT NULL DEFAULT ''",
             "image_count": "INTEGER NOT NULL DEFAULT 0",
+            "property_type": "TEXT NOT NULL DEFAULT ''",
+            "community": "TEXT NOT NULL DEFAULT ''",
+            "features": "TEXT NOT NULL DEFAULT ''",
+            "source_site": "TEXT NOT NULL DEFAULT ''",
+            "source_id": "INTEGER",
+            "last_seen_at": "TEXT NOT NULL DEFAULT ''",
         }
         for column, definition in additions.items():
             if column not in existing:
@@ -162,6 +221,8 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             SELECT p.id, p.external_id, p.title, p.address, p.price,
                    p.layout, p.size, p.url, p.status, p.source_url, p.updated_at,
                    p.image_paths, p.image_count,
+                   p.property_type, p.community, p.features, p.source_site,
+                   p.source_id, p.last_seen_at,
                    COALESCE(n.favorite, 0) AS favorite,
                    COALESCE(n.tag, '') AS tag,
                    COALESCE(n.note, '') AS note
@@ -199,59 +260,453 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             ).fetchone()
         return dict(row) if row else None
 
-    def upsert_properties(self, properties: list[dict[str, Any]], source_url: str) -> int:
-        saved = 0
+    def upsert_properties(
+        self,
+        properties: list[dict[str, Any]],
+        source_url: str,
+        source_id: int | None = None,
+        sync_run_id: int | None = None,
+    ) -> int:
+        """向下相容的簡易寫入介面（單一物件匯入、舊呼叫端使用）。"""
+        counts = self.sync_properties_for_source(
+            properties,
+            source_url=source_url,
+            source_id=source_id,
+            sync_run_id=sync_run_id,
+            mark_offline=False,
+        )
+        return counts["new"] + counts["updated"]
+
+    def sync_properties_for_source(
+        self,
+        properties: list[dict[str, Any]],
+        source_url: str,
+        source_id: int | None = None,
+        sync_run_id: int | None = None,
+        mark_offline: bool = False,
+    ) -> dict[str, int]:
+        """寫入這次同步抓到的物件，並記錄新增／異動／下架。
+
+        只有 mark_offline=True 時才會把這個來源「這次沒抓到」的既有物件
+        標記下架；呼叫端必須自行確保這次同步是「完整且沒有失敗頁面」，
+        避免同步中途失敗把大量物件誤標下架。
+        """
+        counts = {
+            "new": 0,
+            "updated": 0,
+            "price_changed": 0,
+            "content_changed": 0,
+            "online_again": 0,
+            "offline": 0,
+        }
+        seen_ids: list[int] = []
+
         with self.connect() as conn:
             for item in properties:
-                external_id = str(item.get("external_id", "")).strip()
-                url = str(item.get("url", "")).strip()
-                existing = None
-                if external_id:
-                    existing = conn.execute(
-                        "SELECT id FROM properties WHERE external_id=? LIMIT 1",
-                        (external_id,),
-                    ).fetchone()
-                if existing is None and url:
-                    existing = conn.execute(
-                        "SELECT id FROM properties WHERE url=? LIMIT 1",
-                        (url,),
-                    ).fetchone()
-                image_paths="\n".join(item.get("image_paths", []))
-                image_count=int(item.get("image_count",0))
-                values = (
-                    external_id,
-                    str(item.get("title", "")).strip(),
-                    str(item.get("address", "")).strip(),
-                    str(item.get("price", "")).strip(),
-                    str(item.get("layout", "")).strip(),
-                    str(item.get("size", "")).strip(),
-                    url,
-                    str(item.get("status", "active")).strip() or "active",
-                    source_url,
-                    image_paths,
-                    image_count,
+                property_id, change = self._upsert_property_row(
+                    conn, item, source_url, source_id, sync_run_id
                 )
-                if existing:
-                    conn.execute(
-                        """
-                        UPDATE properties SET external_id=?, title=?, address=?, price=?,
-                            layout=?, size=?, url=?, status=?, source_url=?, image_paths=?, image_count=?,
-                            updated_at=CURRENT_TIMESTAMP WHERE id=?
-                        """,
-                        values + (existing["id"],),
-                    )
-                else:
-                    conn.execute(
-                        """
-                        INSERT INTO properties(
-                            external_id, title, address, price, layout, size,
-                            url, status, source_url, image_paths, image_count
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        values,
-                    )
-                saved += 1
-        return saved
+                seen_ids.append(property_id)
+                counts["new" if change["created"] else "updated"] += 1
+                if change["price_changed"]:
+                    counts["price_changed"] += 1
+                if change["content_changed"]:
+                    counts["content_changed"] += 1
+                if change["online_again"]:
+                    counts["online_again"] += 1
+
+            if mark_offline and source_id is not None:
+                counts["offline"] = self._mark_offline_properties(
+                    conn, source_id, seen_ids, sync_run_id
+                )
+
+        return counts
+
+    def _upsert_property_row(
+        self,
+        conn: sqlite3.Connection,
+        item: dict[str, Any],
+        source_url: str,
+        source_id: int | None,
+        sync_run_id: int | None,
+    ) -> tuple[int, dict[str, bool]]:
+        external_id = str(item.get("external_id", "")).strip()
+        url = str(item.get("url", "")).strip()
+
+        existing = None
+        if external_id:
+            existing = conn.execute(
+                "SELECT * FROM properties WHERE external_id=? LIMIT 1",
+                (external_id,),
+            ).fetchone()
+        if existing is None and url:
+            existing = conn.execute(
+                "SELECT * FROM properties WHERE url=? LIMIT 1",
+                (url,),
+            ).fetchone()
+
+        image_paths_value = item.get("image_paths", [])
+        if isinstance(image_paths_value, str):
+            image_paths = image_paths_value
+        else:
+            image_paths = "\n".join(image_paths_value)
+
+        features_value = item.get("features", [])
+        if isinstance(features_value, str):
+            features = features_value
+        else:
+            features = "、".join(features_value)
+
+        new_price = str(item.get("price", "")).strip()
+        new_fields = {
+            "external_id": external_id,
+            "title": str(item.get("title", "")).strip(),
+            "address": str(item.get("address", "")).strip(),
+            "price": new_price,
+            "layout": str(item.get("layout", "")).strip(),
+            "size": str(item.get("size", "")).strip(),
+            "url": url,
+            "status": str(item.get("status", "active")).strip() or "active",
+            "source_url": source_url,
+            "image_paths": image_paths,
+            "image_count": int(item.get("image_count", 0) or 0),
+            "property_type": str(item.get("property_type", "")).strip(),
+            "community": str(item.get("community", "")).strip(),
+            "features": features,
+            "source_site": str(item.get("source_site", "")).strip(),
+        }
+        if source_id is not None:
+            new_fields["source_id"] = source_id
+
+        change = {
+            "created": existing is None,
+            "price_changed": False,
+            "content_changed": False,
+            "online_again": False,
+        }
+
+        content_compare_keys = (
+            "title", "address", "layout", "size", "property_type",
+            "community", "features", "image_count",
+        )
+
+        if existing is not None:
+            old_price = str(existing["price"] or "").strip()
+            if new_price and old_price and new_price != old_price:
+                change["price_changed"] = True
+            for key in content_compare_keys:
+                old_value = existing[key] if key in existing.keys() else ""
+                if old_value is None:
+                    old_value = ""
+                if str(new_fields[key]) != str(old_value):
+                    change["content_changed"] = True
+                    break
+            if str(existing["status"] or "") == "offline" and new_fields["status"] != "offline":
+                change["online_again"] = True
+
+        columns = list(new_fields.keys())
+        values = [new_fields[key] for key in columns]
+
+        if existing is None:
+            placeholders = ", ".join("?" for _ in columns)
+            cur = conn.execute(
+                f"""
+                INSERT INTO properties(
+                    {', '.join(columns)}, last_seen_at
+                ) VALUES ({placeholders}, CURRENT_TIMESTAMP)
+                """,
+                values,
+            )
+            property_id = int(cur.lastrowid)
+        else:
+            assignments = ", ".join(f"{key}=?" for key in columns)
+            conn.execute(
+                f"""
+                UPDATE properties SET {assignments},
+                    updated_at=CURRENT_TIMESTAMP, last_seen_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                values + [existing["id"]],
+            )
+            property_id = int(existing["id"])
+
+        if change["price_changed"]:
+            self._record_property_change(
+                conn, property_id, "price_changed", old_price, new_price, sync_run_id
+            )
+        if change["content_changed"]:
+            self._record_property_change(
+                conn, property_id, "content_changed", "", "", sync_run_id
+            )
+        if change["online_again"]:
+            self._record_property_change(
+                conn, property_id, "online_again", "offline", "active", sync_run_id
+            )
+        if change["created"]:
+            self._record_property_change(
+                conn, property_id, "created", "", new_fields["title"], sync_run_id
+            )
+
+        return property_id, change
+
+    def _mark_offline_properties(
+        self,
+        conn: sqlite3.Connection,
+        source_id: int,
+        seen_ids: list[int],
+        sync_run_id: int | None,
+    ) -> int:
+        placeholders = ", ".join("?" for _ in seen_ids) if seen_ids else ""
+        where_not_seen = f"AND id NOT IN ({placeholders})" if placeholders else ""
+        params: list[Any] = [source_id]
+        params.extend(seen_ids)
+
+        candidates = conn.execute(
+            f"""
+            SELECT id FROM properties
+            WHERE source_id=? AND status != 'offline' {where_not_seen}
+            """,
+            params,
+        ).fetchall()
+
+        active_total = conn.execute(
+            "SELECT COUNT(*) FROM properties WHERE source_id=? AND status != 'offline'",
+            (source_id,),
+        ).fetchone()[0]
+
+        # 安全判定：單次同步不應該把來源中大部分物件都判定下架，
+        # 避免解析失敗或網站改版時誤刪一整批物件的狀態。
+        if active_total > 0 and len(candidates) > max(3, active_total * 0.5):
+            return 0
+
+        for row in candidates:
+            conn.execute(
+                "UPDATE properties SET status='offline', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (row["id"],),
+            )
+            self._record_property_change(
+                conn, row["id"], "offline", "active", "offline", sync_run_id
+            )
+
+        return len(candidates)
+
+    @staticmethod
+    def _record_property_change(
+        conn: sqlite3.Connection,
+        property_id: int,
+        change_type: str,
+        old_value: str,
+        new_value: str,
+        sync_run_id: int | None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO property_changes(property_id, change_type, old_value, new_value, sync_run_id)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (property_id, change_type, old_value, new_value, sync_run_id),
+        )
+
+    def list_property_changes(
+        self,
+        limit: int = 100,
+        change_type: str = "",
+        since: str = "",
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT c.*, p.title AS property_title, p.external_id AS property_external_id
+            FROM property_changes c
+            LEFT JOIN properties p ON p.id = c.property_id
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if change_type:
+            clauses.append("c.change_type = ?")
+            params.append(change_type)
+        if since:
+            clauses.append("c.detected_at >= ?")
+            params.append(since)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY c.detected_at DESC, c.id DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+
+    # ---------------------------------------------------------------
+    # Sync Center：同步來源
+    # ---------------------------------------------------------------
+
+    def list_sync_sources(self) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            return [
+                dict(row)
+                for row in conn.execute(
+                    "SELECT * FROM sync_sources ORDER BY name"
+                ).fetchall()
+            ]
+
+    def get_sync_source(self, source_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM sync_sources WHERE id=?", (source_id,)
+            ).fetchone()
+        return dict(row) if row else None
+
+    def save_sync_source(
+        self, data: dict[str, Any], source_id: int | None = None
+    ) -> int:
+        name = str(data.get("name", "")).strip() or "未命名來源"
+        source_type = str(data.get("source_type", "yungching_store")).strip() or "yungching_store"
+        url = str(data.get("url", "")).strip()
+        enabled = 1 if data.get("enabled", True) else 0
+        auto_sync_enabled = 1 if data.get("auto_sync_enabled", False) else 0
+
+        if not url:
+            raise ValueError("同步來源網址不可空白")
+
+        with self.connect() as conn:
+            if source_id is None:
+                cur = conn.execute(
+                    """
+                    INSERT INTO sync_sources(name, source_type, url, enabled, auto_sync_enabled)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (name, source_type, url, enabled, auto_sync_enabled),
+                )
+                return int(cur.lastrowid)
+            conn.execute(
+                """
+                UPDATE sync_sources SET name=?, source_type=?, url=?, enabled=?,
+                    auto_sync_enabled=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (name, source_type, url, enabled, auto_sync_enabled, source_id),
+            )
+            return source_id
+
+    def delete_sync_source(self, source_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM sync_sources WHERE id=?", (source_id,))
+
+    def set_sync_source_enabled(self, source_id: int, enabled: bool) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE sync_sources SET enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (1 if enabled else 0, source_id),
+            )
+
+    def set_sync_source_auto(self, source_id: int, enabled: bool) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE sync_sources SET auto_sync_enabled=?, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (1 if enabled else 0, source_id),
+            )
+
+    def touch_sync_source_last_sync(self, source_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sync_sources SET last_sync_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP WHERE id=?
+                """,
+                (source_id,),
+            )
+
+    # ---------------------------------------------------------------
+    # Sync Center：同步紀錄
+    # ---------------------------------------------------------------
+
+    def create_sync_run(self, source_id: int | None, source_url: str) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO sync_runs(source_id, source_url, status)
+                VALUES (?, ?, 'running')
+                """,
+                (source_id, source_url),
+            )
+            return int(cur.lastrowid)
+
+    def finish_sync_run(
+        self,
+        run_id: int,
+        status: str,
+        found_count: int = 0,
+        new_count: int = 0,
+        updated_count: int = 0,
+        offline_count: int = 0,
+        failed_count: int = 0,
+        duration_seconds: int = 0,
+        error_message: str = "",
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sync_runs SET
+                    status=?, found_count=?, new_count=?, updated_count=?,
+                    offline_count=?, failed_count=?, duration_seconds=?,
+                    error_message=?, finished_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (
+                    status, found_count, new_count, updated_count,
+                    offline_count, failed_count, duration_seconds,
+                    error_message, run_id,
+                ),
+            )
+
+    def list_sync_runs(
+        self, source_id: int | None = None, limit: int = 50
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT r.*, COALESCE(s.name, '手動同步（未建立來源）') AS source_name
+            FROM sync_runs r
+            LEFT JOIN sync_sources s ON s.id = r.source_id
+        """
+        params: list[Any] = []
+        if source_id is not None:
+            sql += " WHERE r.source_id = ?"
+            params.append(source_id)
+        sql += " ORDER BY r.started_at DESC, r.id DESC LIMIT ?"
+        params.append(limit)
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+
+    def get_last_sync_run(self, source_id: int | None = None) -> dict[str, Any] | None:
+        runs = self.list_sync_runs(source_id=source_id, limit=1)
+        return runs[0] if runs else None
+
+    def sync_dashboard_summary(self) -> dict[str, Any]:
+        with self.connect() as conn:
+            last_run = conn.execute(
+                "SELECT * FROM sync_runs WHERE status != 'running' ORDER BY started_at DESC, id DESC LIMIT 1"
+            ).fetchone()
+            today_new = conn.execute(
+                "SELECT COUNT(*) FROM property_changes WHERE change_type='created' AND date(detected_at)=date('now', 'localtime')"
+            ).fetchone()[0]
+            today_price = conn.execute(
+                "SELECT COUNT(*) FROM property_changes WHERE change_type='price_changed' AND date(detected_at)=date('now', 'localtime')"
+            ).fetchone()[0]
+            today_offline = conn.execute(
+                "SELECT COUNT(*) FROM property_changes WHERE change_type='offline' AND date(detected_at)=date('now', 'localtime')"
+            ).fetchone()[0]
+            today_failed_runs = conn.execute(
+                "SELECT COUNT(*) FROM sync_runs WHERE status='failed' AND date(started_at)=date('now', 'localtime')"
+            ).fetchone()[0]
+            total_properties = conn.execute(
+                "SELECT COUNT(*) FROM properties WHERE status != 'offline'"
+            ).fetchone()[0]
+
+        return {
+            "last_sync_at": last_run["started_at"] if last_run else "",
+            "last_sync_status": last_run["status"] if last_run else "",
+            "today_new": today_new,
+            "today_price_changed": today_price,
+            "today_offline": today_offline,
+            "today_failed": today_failed_runs,
+            "total_properties": total_properties,
+        }
 
     def get_note(self, property_id: int) -> dict[str, Any]:
         with self.connect() as conn:

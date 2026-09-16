@@ -143,6 +143,10 @@ class UniversalImportDialog(QDialog):
                 url
             )
             data = result.property_data
+            data.setdefault(
+                "source_site",
+                result.source_name,
+            )
 
             saved = self.db.upsert_properties(
                 [data],

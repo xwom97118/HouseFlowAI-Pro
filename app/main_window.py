@@ -22,6 +22,7 @@ from app.pages.poster import PosterPage
 from app.pages.properties import PropertiesPage
 from app.pages.settings import SettingsPage
 from app.pages.strategy import StrategyPage
+from app.pages.sync_center import SyncCenterPage
 from app.services.database import Database
 from app.styles import APP_QSS
 
@@ -63,6 +64,7 @@ class MainWindow(QMainWindow):
 
         navs = [
             ("dashboard", "🏠  Dashboard"),
+            ("sync_center", "🔄  同步中心"),
             ("properties", "🏡  物件中心"),
             ("poster", "📤  發文中心"),
             ("groups", "📂  社團管理"),
@@ -136,6 +138,11 @@ class MainWindow(QMainWindow):
                 self.db,
                 self.navigate,
             ),
+            "sync_center": SyncCenterPage(
+                self.db,
+                lambda: self.navigate("dashboard"),
+                on_synced=self._on_properties_synced,
+            ),
             "properties": PropertiesPage(
                 self.db,
                 self.open_ai_for_property,
@@ -205,6 +212,7 @@ class MainWindow(QMainWindow):
 
         titles = {
             "dashboard": "Dashboard",
+            "sync_center": "同步中心",
             "properties": "物件中心",
             "poster": "Facebook 發文中心",
             "groups": "Facebook 社團管理",
@@ -262,3 +270,11 @@ class MainWindow(QMainWindow):
 
         self.ai_page.select_property(property_id)
         self.navigate("ai")
+
+    def _on_properties_synced(self) -> None:
+        properties_page = self.pages.get("properties")
+        if properties_page is not None and hasattr(properties_page, "refresh"):
+            properties_page.refresh()
+        dashboard_page = self.pages.get("dashboard")
+        if dashboard_page is not None and hasattr(dashboard_page, "refresh"):
+            dashboard_page.refresh()
