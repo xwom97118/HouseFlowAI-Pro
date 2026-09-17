@@ -2,18 +2,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
-    QFileDialog,
-    QAbstractItemView,
     QDialog,
-    QGroupBox,
+    QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
     QListWidgetItem,
     QMenu,
     QMessageBox,
@@ -24,49 +22,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services import brand_profile
 from app.services.database import Database
 from app.services.facebook_service import FacebookService
 from app.services.copywriting_engine import AJCopyEngine
 from app.widgets.property_picker import PropertyPicker
-from app.widgets.common import SectionTitle
+from app.widgets.common import ImagePreviewList, PropertySummaryCard, SectionTitle
+from app.widgets.schedule_dialog import AddToScheduleDialog
 
-
-class ImagePreviewList(QListWidget):
-    def __init__(self, order_changed) -> None:
-        super().__init__()
-
-        self.order_changed = order_changed
-        self.setViewMode(QListWidget.ViewMode.IconMode)
-        self.setResizeMode(QListWidget.ResizeMode.Adjust)
-        self.setMovement(QListWidget.Movement.Snap)
-        self.setWrapping(True)
-        self.setSpacing(10)
-        self.setIconSize(QSize(150, 110))
-        self.setGridSize(QSize(180, 160))
-        self.setSelectionMode(
-            QAbstractItemView.SelectionMode.SingleSelection
-        )
-        self.setDragDropMode(
-            QAbstractItemView.DragDropMode.InternalMove
-        )
-        self.setDefaultDropAction(
-            Qt.DropAction.MoveAction
-        )
-
-    def dropEvent(self, event) -> None:
-        super().dropEvent(event)
-
-        if callable(self.order_changed):
-            self.order_changed()
-
+COPY_STYLES = ["親切自然", "專業分析", "成交導向", "簡短直接", "短影音口吻"]
 
 
 class PosterPage(QWidget):
-    def __init__(self, db: Database, go_dashboard) -> None:
+    def __init__(self, db: Database, navigate) -> None:
         super().__init__()
 
         self.db = db
-        self.go_dashboard = go_dashboard
+        self.navigate = navigate
         self.facebook = FacebookService()
         self.copy_engine = AJCopyEngine()
         self.current_property_id: int | None = None
@@ -74,15 +46,26 @@ class PosterPage(QWidget):
         self.use_sync_images = True
         self.group_checks: list[tuple[QCheckBox, str]] = []
 
-        root = QVBoxLayout(self)
-        root.setContentsMargins(24, 22, 24, 24)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(scroll, 1)
+
+        content = QWidget()
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
+        root.setContentsMargins(24, 22, 24, 16)
         root.setSpacing(14)
 
         header = QHBoxLayout()
 
         back_button = QPushButton("← 返回 Dashboard")
         back_button.setObjectName("SecondaryButton")
-        back_button.clicked.connect(self.go_dashboard)
+        back_button.clicked.connect(lambda _=False: self.navigate("dashboard"))
 
         self.login_button = QPushButton("登入 Facebook")
         self.login_button.setObjectName("SecondaryButton")
@@ -96,37 +79,81 @@ class PosterPage(QWidget):
         root.addWidget(
             SectionTitle(
                 "Facebook 發文中心",
-                "選擇物件、確認文案與圖片，再一鍵發布至 Facebook。",
+                "依照步驟選擇物件、確認文案與圖片，再排程或發布。",
             )
         )
 
-        root.addWidget(QLabel("選擇物件"))
+        # STEP 1：選擇物件 ------------------------------------------------
+        step1 = self._step_card("STEP 1", "選擇物件")
+        step1_layout = step1.layout()
 
         self.property_picker = PropertyPicker()
-        self.property_picker.property_selected.connect(
-            self.property_changed
-        )
-        root.addWidget(self.property_picker)
+        self.property_picker.property_selected.connect(self.property_changed)
+        step1_layout.addWidget(self.property_picker)
 
-        root.addWidget(QLabel("貼文內容"))
+        self.property_summary = PropertySummaryCard()
+        step1_layout.addWidget(self.property_summary)
+
+        root.addWidget(step1)
+
+        # STEP 2：編輯文案 ------------------------------------------------
+        step2 = self._step_card("STEP 2", "編輯文案")
+        step2_layout = step2.layout()
+
+        content_toolbar = QHBoxLayout()
+        content_toolbar.addStretch()
+
+        generate_button = QPushButton("產生文案")
+        generate_button.setObjectName("SecondaryButton")
+        generate_button.clicked.connect(self.generate_content)
+
+        template_button = QPushButton("套用模板")
+        template_button.setObjectName("SecondaryButton")
+        template_button.clicked.connect(self.apply_template)
+
+        insert_compliance_button = QPushButton("插入經紀業資訊")
+        insert_compliance_button.setObjectName("SecondaryButton")
+        insert_compliance_button.clicked.connect(self.insert_compliance_footer)
+
+        clear_content_button = QPushButton("清空")
+        clear_content_button.setObjectName("SecondaryButton")
+        clear_content_button.clicked.connect(self.clear_content)
+
+        content_toolbar.addWidget(generate_button)
+        content_toolbar.addWidget(template_button)
+        content_toolbar.addWidget(insert_compliance_button)
+        content_toolbar.addWidget(clear_content_button)
+        step2_layout.addLayout(content_toolbar)
 
         self.content_editor = QPlainTextEdit()
-        self.content_editor.setPlaceholderText(
-            "請輸入要發布的 Facebook 文案……"
-        )
-        root.addWidget(self.content_editor, 1)
+        self.content_editor.setPlaceholderText("請輸入要發布的 Facebook 文案……")
+        self.content_editor.setMinimumHeight(220)
+        self.content_editor.textChanged.connect(self._update_char_count)
+        step2_layout.addWidget(self.content_editor)
+
+        content_footer = QHBoxLayout()
+        self.char_count_label = QLabel("字數：0")
+        self.char_count_label.setObjectName("Muted")
+        compliance_hint = QLabel("經紀業資訊會依設定自動加入。")
+        compliance_hint.setObjectName("Muted")
+        content_footer.addWidget(self.char_count_label)
+        content_footer.addStretch()
+        content_footer.addWidget(compliance_hint)
+        step2_layout.addLayout(content_footer)
+
+        root.addWidget(step2)
+
+        # STEP 3：選擇圖片 ------------------------------------------------
+        step3 = self._step_card("STEP 3", "選擇圖片")
+        step3_layout = step3.layout()
 
         image_row = QHBoxLayout()
 
         self.image_label = QLabel("尚未選擇圖片")
+        self.image_label.setObjectName("Muted")
         self.use_sync_checkbox = QCheckBox("使用同步照片")
         self.use_sync_checkbox.setChecked(True)
-        self.use_sync_checkbox.toggled.connect(
-            self.sync_image_mode_changed
-        )
-
-        image_row.addWidget(self.use_sync_checkbox)
-        self.image_label.setObjectName("MutedLabel")
+        self.use_sync_checkbox.toggled.connect(self.sync_image_mode_changed)
 
         choose_images_button = QPushButton("選擇圖片")
         choose_images_button.setObjectName("SecondaryButton")
@@ -136,40 +163,33 @@ class PosterPage(QWidget):
         clear_images_button.setObjectName("SecondaryButton")
         clear_images_button.clicked.connect(self.clear_images)
 
+        image_row.addWidget(self.use_sync_checkbox)
         image_row.addWidget(self.image_label, 1)
         image_row.addWidget(choose_images_button)
         image_row.addWidget(clear_images_button)
-        root.addLayout(image_row)
+        step3_layout.addLayout(image_row)
 
-        preview_hint = QLabel(
-            "圖片可拖曳排序；雙擊放大；右鍵可設為封面或移除。"
-        )
-        preview_hint.setObjectName("MutedLabel")
-        root.addWidget(preview_hint)
+        preview_hint = QLabel("圖片可拖曳排序；雙擊放大；右鍵可設為封面或移除。")
+        preview_hint.setObjectName("Muted")
+        step3_layout.addWidget(preview_hint)
 
-        self.preview_list = ImagePreviewList(
-            self.image_order_changed
-        )
+        self.preview_list = ImagePreviewList(self.image_order_changed)
         self.preview_list.setMinimumHeight(190)
-        self.preview_list.setMaximumHeight(360)
-        self.preview_list.itemDoubleClicked.connect(
-            self.open_image_preview
-        )
-        self.preview_list.setContextMenuPolicy(
-            Qt.ContextMenuPolicy.CustomContextMenu
-        )
-        self.preview_list.customContextMenuRequested.connect(
-            self.show_image_menu
-        )
-        root.addWidget(self.preview_list)
+        self.preview_list.setMaximumHeight(320)
+        self.preview_list.itemDoubleClicked.connect(self.open_image_preview)
+        self.preview_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.preview_list.customContextMenuRequested.connect(self.show_image_menu)
+        step3_layout.addWidget(self.preview_list)
 
-        target_box = QGroupBox("發布位置")
-        target_layout = QVBoxLayout(target_box)
+        root.addWidget(step3)
 
-        self.publish_profile = QCheckBox(
-            "準備發布至 Facebook 個人動態"
-        )
-        target_layout.addWidget(self.publish_profile)
+        # STEP 4：選擇發布位置 --------------------------------------------
+        step4 = self._step_card("STEP 4", "選擇發布位置")
+        step4_layout = step4.layout()
+
+        self.publish_profile = QCheckBox("Facebook 個人動態")
+        self.publish_profile.toggled.connect(self._update_target_summary)
+        step4_layout.addWidget(self.publish_profile)
 
         group_header = QHBoxLayout()
         group_header.addWidget(QLabel("已儲存的 Facebook 社團"))
@@ -190,7 +210,7 @@ class PosterPage(QWidget):
         group_header.addWidget(select_all_button)
         group_header.addWidget(clear_all_button)
         group_header.addWidget(refresh_groups_button)
-        target_layout.addLayout(group_header)
+        step4_layout.addLayout(group_header)
 
         self.groups_container = QWidget()
         self.groups_layout = QVBoxLayout(self.groups_container)
@@ -201,12 +221,15 @@ class PosterPage(QWidget):
         self.groups_scroll.setWidgetResizable(True)
         self.groups_scroll.setMaximumHeight(160)
         self.groups_scroll.setWidget(self.groups_container)
-        target_layout.addWidget(self.groups_scroll)
+        step4_layout.addWidget(self.groups_scroll)
 
-        root.addWidget(target_box)
+        self.target_summary_label = QLabel("已選擇 0 個發布位置")
+        self.target_summary_label.setObjectName("Muted")
+        step4_layout.addWidget(self.target_summary_label)
 
-        button_row = QHBoxLayout()
+        root.addWidget(step4)
 
+        utility_row = QHBoxLayout()
         reload_button = QPushButton("重新載入物件")
         reload_button.setObjectName("SecondaryButton")
         reload_button.clicked.connect(self.reload_properties)
@@ -214,32 +237,75 @@ class PosterPage(QWidget):
         copy_button = QPushButton("複製文案")
         copy_button.setObjectName("SecondaryButton")
         copy_button.clicked.connect(self.copy_content)
+        utility_row.addWidget(reload_button)
+        utility_row.addWidget(copy_button)
+        utility_row.addStretch()
+        root.addLayout(utility_row)
 
-        preview_button = QPushButton("確認發布內容")
+        root.addStretch()
+
+        # STEP 5：主要操作（固定在畫面底部，不隨內容捲動） -------------------
+        cta_bar = QFrame()
+        cta_bar.setObjectName("CtaBar")
+        cta_layout = QHBoxLayout(cta_bar)
+        cta_layout.setContentsMargins(24, 12, 24, 12)
+
+        self.status_label = QLabel("請先登入 Facebook，再選擇發布位置。")
+        self.status_label.setObjectName("Muted")
+        cta_layout.addWidget(self.status_label, 1)
+
+        draft_button = QPushButton("儲存草稿")
+        draft_button.setObjectName("SecondaryButton")
+        draft_button.clicked.connect(self.save_draft)
+
+        preview_button = QPushButton("預覽貼文")
         preview_button.setObjectName("SecondaryButton")
         preview_button.clicked.connect(self.preview_post)
 
-        self.publish_button = QPushButton("確認並一鍵發布")
-        self.publish_button.setObjectName("PrimaryButton")
+        self.schedule_button = QPushButton("加入排程")
+        self.schedule_button.setObjectName("PrimaryButton")
+        self.schedule_button.clicked.connect(self.add_to_schedule)
+
+        self.publish_button = QPushButton("立即發布")
+        self.publish_button.setObjectName("SuccessButton")
         self.publish_button.clicked.connect(self.start_publish)
 
-        button_row.addWidget(reload_button)
-        button_row.addWidget(copy_button)
-        button_row.addWidget(preview_button)
-        button_row.addStretch()
-        button_row.addWidget(self.publish_button)
+        cta_layout.addWidget(draft_button)
+        cta_layout.addWidget(preview_button)
+        cta_layout.addWidget(self.schedule_button)
+        cta_layout.addWidget(self.publish_button)
 
-        root.addLayout(button_row)
-
-        self.status_label = QLabel(
-            "請先登入 Facebook，再選擇發布位置。"
-        )
-        self.status_label.setObjectName("MutedLabel")
-        root.addWidget(self.status_label)
+        outer.addWidget(cta_bar)
 
         self.reload_properties()
         self.reload_groups()
         self.refresh_image_preview()
+        self._update_char_count()
+        self._update_target_summary()
+
+    @staticmethod
+    def _step_card(step: str, title: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("Card")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        badge = QLabel(step)
+        badge.setObjectName("StepBadge")
+        title_label = QLabel(title)
+        title_label.setObjectName("StepTitle")
+        header.addWidget(badge)
+        header.addWidget(title_label)
+        header.addStretch()
+        layout.addLayout(header)
+
+        return card
+
+    # ------------------------------------------------------------------
+    # 圖片
+    # ------------------------------------------------------------------
 
     def choose_images(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -299,18 +365,10 @@ class PosterPage(QWidget):
                 icon = QIcon(scaled)
 
             prefix = "★ 封面" if index == 0 else f"{index + 1:02d}"
-            item = QListWidgetItem(
-                icon,
-                f"{prefix}\n{Path(image_path).name}",
-            )
-            item.setData(
-                Qt.ItemDataRole.UserRole,
-                image_path,
-            )
+            item = QListWidgetItem(icon, f"{prefix}\n{Path(image_path).name}")
+            item.setData(Qt.ItemDataRole.UserRole, image_path)
             item.setToolTip(image_path)
-            item.setTextAlignment(
-                Qt.AlignmentFlag.AlignCenter
-            )
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item.setFlags(
                 item.flags()
                 | Qt.ItemFlag.ItemIsDragEnabled
@@ -319,18 +377,14 @@ class PosterPage(QWidget):
 
             self.preview_list.addItem(item)
 
-        self.image_label.setText(
-            f"目前共 {len(self.image_paths)} 張照片"
-        )
+        self.image_label.setText(f"目前共 {len(self.image_paths)} 張照片")
 
     def image_order_changed(self) -> None:
         ordered_paths: list[str] = []
 
         for index in range(self.preview_list.count()):
             item = self.preview_list.item(index)
-            path = item.data(
-                Qt.ItemDataRole.UserRole
-            )
+            path = item.data(Qt.ItemDataRole.UserRole)
 
             if path:
                 ordered_paths.append(str(path))
@@ -338,17 +392,10 @@ class PosterPage(QWidget):
         if ordered_paths:
             self.image_paths = ordered_paths
             self.refresh_image_preview()
-            self.status_label.setText(
-                "圖片順序已更新，Facebook 將依此順序上傳。"
-            )
+            self.status_label.setText("圖片順序已更新，Facebook 將依此順序上傳。")
 
-    def open_image_preview(
-        self,
-        item: QListWidgetItem,
-    ) -> None:
-        image_path = item.data(
-            Qt.ItemDataRole.UserRole
-        )
+    def open_image_preview(self, item: QListWidgetItem) -> None:
+        image_path = item.data(Qt.ItemDataRole.UserRole)
 
         if not image_path:
             return
@@ -356,29 +403,20 @@ class PosterPage(QWidget):
         pixmap = QPixmap(str(image_path))
 
         if pixmap.isNull():
-            QMessageBox.warning(
-                self,
-                "無法開啟圖片",
-                "這張圖片無法載入。",
-            )
+            QMessageBox.warning(self, "無法開啟圖片", "這張圖片無法載入。")
             return
 
         dialog = QDialog(self)
-        dialog.setWindowTitle(
-            Path(str(image_path)).name
-        )
+        dialog.setWindowTitle(Path(str(image_path)).name)
         dialog.resize(1000, 760)
 
         layout = QVBoxLayout(dialog)
 
         image_label = QLabel()
-        image_label.setAlignment(
-            Qt.AlignmentFlag.AlignCenter
-        )
+        image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         scaled = pixmap.scaled(
-            940,
-            680,
+            940, 680,
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.SmoothTransformation,
         )
@@ -399,9 +437,7 @@ class PosterPage(QWidget):
         if item is None:
             return
 
-        image_path = item.data(
-            Qt.ItemDataRole.UserRole
-        )
+        image_path = item.data(Qt.ItemDataRole.UserRole)
 
         if not image_path:
             return
@@ -413,9 +449,7 @@ class PosterPage(QWidget):
         menu.addSeparator()
         remove_action = menu.addAction("移除這張圖片")
 
-        selected = menu.exec(
-            self.preview_list.mapToGlobal(position)
-        )
+        selected = menu.exec(self.preview_list.mapToGlobal(position))
 
         if selected == cover_action:
             self.set_cover_image(str(image_path))
@@ -424,10 +458,7 @@ class PosterPage(QWidget):
         elif selected == remove_action:
             self.remove_image(str(image_path))
 
-    def set_cover_image(
-        self,
-        image_path: str,
-    ) -> None:
+    def set_cover_image(self, image_path: str) -> None:
         if image_path not in self.image_paths:
             return
 
@@ -435,14 +466,9 @@ class PosterPage(QWidget):
         self.image_paths.insert(0, image_path)
         self.refresh_image_preview()
 
-        self.status_label.setText(
-            f"已將 {Path(image_path).name} 設為封面。"
-        )
+        self.status_label.setText(f"已將 {Path(image_path).name} 設為封面。")
 
-    def remove_image(
-        self,
-        image_path: str,
-    ) -> None:
+    def remove_image(self, image_path: str) -> None:
         if image_path not in self.image_paths:
             return
 
@@ -450,8 +476,7 @@ class PosterPage(QWidget):
             self,
             "移除圖片",
             f"確定不發布這張圖片嗎？\n{Path(image_path).name}",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
 
@@ -461,9 +486,7 @@ class PosterPage(QWidget):
         self.image_paths.remove(image_path)
         self.refresh_image_preview()
 
-        self.status_label.setText(
-            f"已移除 {Path(image_path).name}，原始檔案沒有被刪除。"
-        )
+        self.status_label.setText(f"已移除 {Path(image_path).name}，原始檔案沒有被刪除。")
 
     def sync_image_mode_changed(self, checked: bool) -> None:
         self.use_sync_images = checked
@@ -473,25 +496,17 @@ class PosterPage(QWidget):
         else:
             self.refresh_image_preview()
 
+    # ------------------------------------------------------------------
+    # 物件 / 社團
+    # ------------------------------------------------------------------
+
     def reload_properties(self) -> None:
-        current_id = (
-            self.current_property_id
-            or self.property_picker.current_property_id()
-        )
-
+        current_id = self.current_property_id or self.property_picker.current_property_id()
         rows = self.db.list_properties()
-
-        self.property_picker.set_properties(
-            rows,
-            selected_id=current_id,
-        )
+        self.property_picker.set_properties(rows, selected_id=current_id)
 
     def reload_groups(self) -> None:
-        selected_urls = {
-            url
-            for checkbox, url in self.group_checks
-            if checkbox.isChecked()
-        }
+        selected_urls = {url for checkbox, url in self.group_checks if checkbox.isChecked()}
 
         while self.groups_layout.count():
             item = self.groups_layout.takeAt(0)
@@ -503,10 +518,8 @@ class PosterPage(QWidget):
         groups = self.db.enabled_groups()
 
         if not groups:
-            empty_label = QLabel(
-                "尚未建立社團。請先到「社團管理」新增常用社團。"
-            )
-            empty_label.setObjectName("MutedLabel")
+            empty_label = QLabel("尚未建立社團。請先到「社團管理」新增常用社團。")
+            empty_label.setObjectName("Muted")
             self.groups_layout.addWidget(empty_label)
             self.groups_layout.addStretch()
             return
@@ -521,11 +534,13 @@ class PosterPage(QWidget):
             checkbox = QCheckBox(name)
             checkbox.setToolTip(url)
             checkbox.setChecked(url in selected_urls)
+            checkbox.toggled.connect(self._update_target_summary)
 
             self.groups_layout.addWidget(checkbox)
             self.group_checks.append((checkbox, url))
 
         self.groups_layout.addStretch()
+        self._update_target_summary()
 
     def select_all_groups(self) -> None:
         for checkbox, _ in self.group_checks:
@@ -535,77 +550,106 @@ class PosterPage(QWidget):
         for checkbox, _ in self.group_checks:
             checkbox.setChecked(False)
 
-    def property_changed(
-        self,
-        property_id: int | None = None,
-    ) -> None:
+    def _update_target_summary(self, *_args) -> None:
+        count = len(self.get_targets())
+        self.target_summary_label.setText(f"已選擇 {count} 個發布位置")
+
+    def _update_char_count(self) -> None:
+        length = len(self.content_editor.toPlainText())
+        self.char_count_label.setText(f"字數：{length}")
+
+    def property_changed(self, property_id: int | None = None) -> None:
         if property_id is None:
-            property_id = (
-                self.property_picker.current_property_id()
-            )
+            property_id = self.property_picker.current_property_id()
 
         if property_id is None:
             self.current_property_id = None
             self.content_editor.clear()
             self.image_paths = []
+            self.property_summary.set_property(None)
             self.refresh_image_preview()
             return
 
         self.current_property_id = int(property_id)
 
-        property_data = self.db.get_property(
-            self.current_property_id
-        )
+        property_data = self.db.get_property(self.current_property_id)
 
         if not property_data:
             self.content_editor.clear()
+            self.property_summary.set_property(None)
             return
 
-        profile = {
-            "brand_slogan": self.db.get_setting(
-                "brand_slogan",
-                "",
-            ),
-            "default_cta": self.db.get_setting(
-                "default_cta",
-                "",
-            ),
-            "default_hashtags": self.db.get_setting(
-                "default_hashtags",
-                "",
-            ),
-        }
+        self.property_summary.set_property(property_data)
 
-        content = self.copy_engine.generate(
-            property_data,
-            profile=profile,
-        )
+        profile = brand_profile.load_profile(self.db)
+        content = self.copy_engine.generate(property_data, profile=profile)
         self.content_editor.setPlainText(content)
 
         if self.use_sync_images:
-            image_paths = str(
-                property_data.get(
-                    "image_paths",
-                    "",
-                )
-            ).strip()
+            image_paths = str(property_data.get("image_paths", "")).strip()
 
             self.image_paths = [
-                path
-                for path in image_paths.split("\n")
-                if path and Path(path).exists()
+                path for path in image_paths.split("\n") if path and Path(path).exists()
             ]
 
             if self.image_paths:
-                self.image_label.setText(
-                    f"已同步 {len(self.image_paths)} 張照片"
-                )
+                self.image_label.setText(f"已同步 {len(self.image_paths)} 張照片")
             else:
-                self.image_label.setText(
-                    "此物件尚未同步照片"
-                )
+                self.image_label.setText("此物件尚未同步照片")
 
             self.refresh_image_preview()
+
+    # ------------------------------------------------------------------
+    # 文案工具列
+    # ------------------------------------------------------------------
+
+    def generate_content(self) -> None:
+        if self.current_property_id is None:
+            QMessageBox.information(self, "尚未選擇物件", "請先選擇一筆物件。")
+            return
+        self.property_changed(self.current_property_id)
+        self.status_label.setText("已重新產生文案。")
+
+    def apply_template(self) -> None:
+        if self.current_property_id is None:
+            QMessageBox.information(self, "尚未選擇物件", "請先選擇一筆物件。")
+            return
+
+        menu = QMenu(self)
+        actions = {menu.addAction(style): style for style in COPY_STYLES}
+        selected = menu.exec(QGuiApplication.instance().primaryScreen().availableGeometry().center())
+        chosen_style = actions.get(selected)
+        if not chosen_style:
+            return
+
+        self.db.set_setting("copy_style", chosen_style)
+        property_data = self.db.get_property(self.current_property_id)
+        if not property_data:
+            return
+
+        profile = brand_profile.load_profile(self.db)
+        content = self.copy_engine.generate(property_data, profile=profile, style=chosen_style)
+        self.content_editor.setPlainText(content)
+        self.status_label.setText(f"已套用「{chosen_style}」模板。")
+
+    def insert_compliance_footer(self) -> None:
+        profile = brand_profile.load_profile(self.db)
+
+        if not brand_profile.is_compliance_complete(profile):
+            missing = "、".join(brand_profile.missing_compliance_labels(profile))
+            self._prompt_missing_compliance(missing)
+            return
+
+        current_text = self.content_editor.toPlainText()
+        updated = brand_profile.insert_or_replace_compliance_footer(current_text, profile)
+        self.content_editor.setPlainText(updated)
+        self.status_label.setText("已插入（或更新）經紀業合規資訊。")
+
+    def clear_content(self) -> None:
+        answer = QMessageBox.question(self, "清空文案", "確定要清空目前的貼文內容嗎？")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.content_editor.clear()
 
     def login_facebook(self) -> None:
         self.login_button.setEnabled(False)
@@ -614,15 +658,9 @@ class PosterPage(QWidget):
 
         try:
             self.facebook.open_login()
-            self.status_label.setText(
-                "Facebook 視窗已關閉，登入狀態已保存。"
-            )
+            self.status_label.setText("Facebook 視窗已關閉，登入狀態已保存。")
         except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "Facebook 開啟失敗",
-                str(exc),
-            )
+            QMessageBox.critical(self, "Facebook 開啟失敗", str(exc))
             self.status_label.setText("Facebook 開啟失敗。")
         finally:
             self.login_button.setEnabled(True)
@@ -631,11 +669,7 @@ class PosterPage(QWidget):
         content = self.content_editor.toPlainText().strip()
 
         if not content:
-            QMessageBox.warning(
-                self,
-                "沒有內容",
-                "請先輸入貼文內容。",
-            )
+            QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
             return
 
         QGuiApplication.clipboard().setText(content)
@@ -646,26 +680,14 @@ class PosterPage(QWidget):
         targets = self.get_targets()
 
         if not content:
-            QMessageBox.warning(
-                self,
-                "沒有內容",
-                "請先輸入貼文內容。",
-            )
+            QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
             return
 
         if not targets:
-            QMessageBox.warning(
-                self,
-                "沒有發布位置",
-                "請勾選個人動態或至少一個社團。",
-            )
+            QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
             return
 
-        selected_group_count = sum(
-            1
-            for checkbox, _ in self.group_checks
-            if checkbox.isChecked()
-        )
+        selected_group_count = sum(1 for checkbox, _ in self.group_checks if checkbox.isChecked())
 
         QMessageBox.information(
             self,
@@ -688,30 +710,130 @@ class PosterPage(QWidget):
 
         return targets
 
+    def get_target_pairs(self) -> list[tuple[str, str]]:
+        pairs: list[tuple[str, str]] = []
+        if self.publish_profile.isChecked():
+            pairs.append(("https://www.facebook.com/", "Facebook 個人動態"))
+        for checkbox, url in self.group_checks:
+            if checkbox.isChecked() and url:
+                pairs.append((url, checkbox.text()))
+        return pairs
+
+    # ------------------------------------------------------------------
+    # 經紀業合規檢查
+    # ------------------------------------------------------------------
+
+    def _prompt_missing_compliance(self, missing_text: str) -> None:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("尚未完成經紀業資訊設定")
+        box.setText("尚未完成經紀業資訊設定")
+        box.setInformativeText(f"缺少：{missing_text}\n\n請先到「設定」完成經紀業資訊，才能發布物件貼文。")
+        go_settings = box.addButton("前往設定", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        if box.clickedButton() == go_settings:
+            self.navigate("settings")
+
+    def _check_compliance_before_publish(self) -> bool:
+        """回傳 True 代表可以繼續（經紀業資訊完整）。"""
+        profile = brand_profile.load_profile(self.db)
+        if brand_profile.is_compliance_complete(profile):
+            return True
+        missing = "、".join(brand_profile.missing_compliance_labels(profile))
+        self._prompt_missing_compliance(missing)
+        return False
+
+    # ------------------------------------------------------------------
+    # 草稿 / 排程 / 發布
+    # ------------------------------------------------------------------
+
+    def save_draft(self) -> None:
+        if self.current_property_id is None:
+            QMessageBox.information(self, "尚未選擇物件", "請先選擇一筆物件。")
+            return
+
+        content = self.content_editor.toPlainText().strip()
+        targets = self.get_target_pairs()
+
+        if not content:
+            QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
+            return
+
+        if not targets:
+            QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
+            return
+
+        for target_url, target_label in targets:
+            self.db.create_schedule(
+                {
+                    "property_id": self.current_property_id,
+                    "platform": "facebook",
+                    "target": target_url,
+                    "target_label": target_label,
+                    "copy_text": content,
+                    "images": self.image_paths,
+                    "scheduled_at": "",
+                    "status": "draft",
+                }
+            )
+
+        self.status_label.setText(f"已儲存 {len(targets)} 筆草稿，可以到「排程管理」繼續編輯。")
+        QMessageBox.information(self, "已儲存草稿", f"已儲存 {len(targets)} 筆草稿。")
+
+    def add_to_schedule(self) -> None:
+        if self.current_property_id is None:
+            QMessageBox.information(self, "尚未選擇物件", "請先選擇一筆物件。")
+            return
+
+        content = self.content_editor.toPlainText().strip()
+        targets = self.get_target_pairs()
+
+        if not content:
+            QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
+            return
+
+        if not targets:
+            QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
+            return
+
+        if not self._check_compliance_before_publish():
+            return
+
+        property_data = self.db.get_property(self.current_property_id)
+
+        dialog = AddToScheduleDialog(
+            db=self.db,
+            property_data=property_data,
+            copy_text=content,
+            image_paths=self.image_paths,
+            targets=targets,
+            parent=self,
+        )
+        dialog.exec()
+
+        if dialog.created_count:
+            self.status_label.setText(f"已加入排程：{dialog.created_count} 筆。")
+            if dialog.go_to_schedule_center:
+                self.navigate("schedule")
+
     def start_publish(self) -> None:
         content = self.content_editor.toPlainText().strip()
         targets = self.get_targets()
 
         if not content:
-            QMessageBox.warning(
-                self,
-                "沒有內容",
-                "請先輸入貼文內容。",
-            )
+            QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
             return
 
         if not targets:
-            QMessageBox.warning(
-                self,
-                "沒有發布位置",
-                "請勾選個人動態或至少一個社團。",
-            )
+            QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
+            return
+
+        if not self._check_compliance_before_publish():
             return
 
         selected_group_names = [
-            checkbox.text()
-            for checkbox, _ in self.group_checks
-            if checkbox.isChecked()
+            checkbox.text() for checkbox, _ in self.group_checks if checkbox.isChecked()
         ]
 
         target_lines: list[str] = []
@@ -719,29 +841,17 @@ class PosterPage(QWidget):
         if self.publish_profile.isChecked():
             target_lines.append("• Facebook 個人動態")
 
-        target_lines.extend(
-            f"• {name}"
-            for name in selected_group_names
-        )
+        target_lines.extend(f"• {name}" for name in selected_group_names)
 
         preview_content = content
 
         if len(preview_content) > 800:
-            preview_content = (
-                preview_content[:800]
-                + "\n……"
-            )
+            preview_content = preview_content[:800] + "\n……"
 
         confirmation = QMessageBox(self)
-        confirmation.setIcon(
-            QMessageBox.Icon.Warning
-        )
-        confirmation.setWindowTitle(
-            "確認一鍵發布"
-        )
-        confirmation.setText(
-            "確認後，HouseFlow 會自動按下 Facebook 的「發布」。"
-        )
+        confirmation.setIcon(QMessageBox.Icon.Warning)
+        confirmation.setWindowTitle("確認立即發布")
+        confirmation.setText("確認後，HouseFlow 會自動按下 Facebook 的「發布」。")
         confirmation.setInformativeText(
             "發布位置：\n"
             + "\n".join(target_lines)
@@ -751,149 +861,66 @@ class PosterPage(QWidget):
             + preview_content
         )
 
-        publish_now = confirmation.addButton(
-            "確認並開始發布",
-            QMessageBox.ButtonRole.AcceptRole,
-        )
-        confirmation.addButton(
-            "取消",
-            QMessageBox.ButtonRole.RejectRole,
-        )
-        confirmation.setDefaultButton(
-            publish_now
-        )
+        publish_now = confirmation.addButton("確認並開始發布", QMessageBox.ButtonRole.AcceptRole)
+        confirmation.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        confirmation.setDefaultButton(publish_now)
         confirmation.exec()
 
         if confirmation.clickedButton() != publish_now:
             return
 
-        QGuiApplication.clipboard().setText(
-            content
-        )
+        QGuiApplication.clipboard().setText(content)
 
         self.publish_button.setEnabled(False)
         self.login_button.setEnabled(False)
         self.status_label.setText(
-            f"正在自動發布 0/{len(targets)}，"
-            "請勿關閉 HouseFlow 或 Chromium……"
+            f"正在自動發布 0/{len(targets)}，請勿關閉 HouseFlow 或 Chromium……"
         )
         QApplication.processEvents()
 
         try:
-            report = self.facebook.publish_posts(
-                targets,
-                content,
-                self.image_paths,
-            )
+            report = self.facebook.publish_posts(targets, content, self.image_paths)
 
-            success_count = int(
-                report.get(
-                    "success_count",
-                    0,
-                )
-            )
-            failed_count = int(
-                report.get(
-                    "failed_count",
-                    0,
-                )
-            )
-            results = list(
-                report.get(
-                    "results",
-                    [],
-                )
-            )
+            success_count = int(report.get("success_count", 0))
+            failed_count = int(report.get("failed_count", 0))
+            results = list(report.get("results", []))
 
             result_lines: list[str] = []
 
-            for index, result in enumerate(
-                results,
-                start=1,
-            ):
-                success = bool(
-                    result.get("success")
-                )
-                url = str(
-                    result.get("url", "")
-                )
-                message = str(
-                    result.get(
-                        "message",
-                        "",
-                    )
-                )
+            for index, result in enumerate(results, start=1):
+                success = bool(result.get("success"))
+                url = str(result.get("url", ""))
+                message = str(result.get("message", ""))
 
                 icon = "✓" if success else "✕"
 
-                if (
-                    url
-                    == "https://www.facebook.com/"
-                ):
+                if url == "https://www.facebook.com/":
                     target_name = "Facebook 個人動態"
                 else:
+                    offset = 2 if self.publish_profile.isChecked() else 1
+                    position = index - offset
                     target_name = (
-                        selected_group_names[
-                            index - (
-                                2
-                                if self.publish_profile.isChecked()
-                                else 1
-                            )
-                        ]
-                        if (
-                            0
-                            <= index - (
-                                2
-                                if self.publish_profile.isChecked()
-                                else 1
-                            )
-                            < len(selected_group_names)
-                        )
+                        selected_group_names[position]
+                        if 0 <= position < len(selected_group_names)
                         else url
                     )
 
                 result_lines.append(
-                    f"{icon} {target_name}"
-                    + (
-                        ""
-                        if success
-                        else f"\n   原因：{message}"
-                    )
+                    f"{icon} {target_name}" + ("" if success else f"\n   原因：{message}")
                 )
 
-            self.status_label.setText(
-                f"發布完成：成功 {success_count}，"
-                f"失敗 {failed_count}。"
-            )
+            self.status_label.setText(f"發布完成：成功 {success_count}，失敗 {failed_count}。")
 
-            summary = (
-                f"成功：{success_count}\n"
-                f"失敗：{failed_count}\n\n"
-                + "\n".join(result_lines)
-            )
+            summary = f"成功：{success_count}\n失敗：{failed_count}\n\n" + "\n".join(result_lines)
 
             if failed_count:
-                QMessageBox.warning(
-                    self,
-                    "一鍵發布完成",
-                    summary,
-                )
+                QMessageBox.warning(self, "立即發布完成", summary)
             else:
-                QMessageBox.information(
-                    self,
-                    "一鍵發布完成",
-                    summary,
-                )
+                QMessageBox.information(self, "立即發布完成", summary)
 
         except Exception as exc:
-            QMessageBox.critical(
-                self,
-                "一鍵發布失敗",
-                str(exc),
-            )
-            self.status_label.setText(
-                "Facebook 一鍵發布失敗。"
-            )
+            QMessageBox.critical(self, "立即發布失敗", str(exc))
+            self.status_label.setText("Facebook 立即發布失敗。")
 
         finally:
             self.publish_button.setEnabled(True)

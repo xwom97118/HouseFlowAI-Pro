@@ -391,4 +391,110 @@ QToolTip {
     border: 0;
     padding: 6px 8px;
 }
+
+#SectionTitleLabel {
+    font-size: 20px;
+    font-weight: 800;
+    color: #14213D;
+}
+
+#StepBadge {
+    background: #2563EB;
+    color: #FFFFFF;
+    border-radius: 6px;
+    padding: 3px 9px;
+    font-size: 12px;
+    font-weight: 800;
+    max-width: 60px;
+}
+
+#StepTitle {
+    color: #172033;
+    font-size: 16px;
+    font-weight: 800;
+}
+
+#CtaBar {
+    background: #FFFFFF;
+    border-top: 1px solid #E6EBF2;
+}
+
+#SuccessButton {
+    background: #16A34A;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-weight: 700;
+}
+
+#SuccessButton:hover {
+    background: #15803D;
+}
+
+#SuccessButton:disabled {
+    background: #A7D8BC;
+    color: #F0FBF4;
+}
+
+#DangerButton {
+    background: #DC2626;
+    color: #FFFFFF;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 16px;
+    font-weight: 700;
+}
+
+#DangerButton:hover {
+    background: #B91C1C;
+}
+
+#PropertyThumb {
+    background: #EEF2F8;
+    border: 1px solid #E1E7F0;
+    border-radius: 10px;
+    color: #8A97A8;
+    font-size: 12px;
+}
+
+#PropertyCardTitle {
+    font-size: 15px;
+    font-weight: 800;
+    color: #172033;
+}
+
+#SidebarFooter {
+    border-top: 1px solid #1F2A44;
+}
+
+#SidebarUser {
+    color: #FFFFFF;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+#SidebarVersion {
+    color: #7C8AA5;
+    font-size: 11px;
+}
+
+#SidebarStatus {
+    color: #34D399;
+    font-size: 11px;
+    font-weight: 700;
+}
+
+#StatusBadge {
+    border-radius: 8px;
+    padding: 2px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+#StatusBadge[kind="success"] { background: #DCFCE7; color: #15803D; }
+#StatusBadge[kind="warning"] { background: #FEF3C7; color: #B45309; }
+#StatusBadge[kind="danger"]  { background: #FEE2E2; color: #B91C1C; }
+#StatusBadge[kind="info"]    { background: #DBEAFE; color: #1D4ED8; }
+#StatusBadge[kind="neutral"] { background: #E5E9F0; color: #526176; }
 """

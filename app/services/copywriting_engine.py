@@ -3,6 +3,16 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from app.services.brand_profile import format_compliance_footer
+
+
+STYLE_OPENERS = {
+    "專業分析": "📊 用數字看懂這間物件的真實價值",
+    "成交導向": "⏰ 近期詢問度高，喜歡建議盡快約看",
+    "簡短直接": "重點先講：",
+    "短影音口吻": "🎬 3 秒帶你看重點",
+}
+
 
 class AJCopyEngine:
     """不依賴 OpenAI 的房仲社群文案引擎 2.0。"""
@@ -11,6 +21,7 @@ class AJCopyEngine:
         self,
         property_data: dict[str, Any],
         profile: dict[str, str] | None = None,
+        style: str = "",
     ) -> str:
         profile = profile or {}
 
@@ -90,6 +101,10 @@ class AJCopyEngine:
                 category,
             )
 
+        opener = STYLE_OPENERS.get(style, "")
+        if opener:
+            content = f"{opener}\n\n{content}"
+
         cta = self._personal_cta(
             profile.get("default_cta", ""),
             keyword,
@@ -103,6 +118,7 @@ class AJCopyEngine:
             "brand_slogan",
             "",
         ).strip()
+        compliance_footer = format_compliance_footer(profile)
 
         parts = [
             content.strip(),
@@ -111,6 +127,9 @@ class AJCopyEngine:
 
         if slogan:
             parts.append(slogan)
+
+        if compliance_footer:
+            parts.append(compliance_footer)
 
         if hashtags:
             parts.append(hashtags)

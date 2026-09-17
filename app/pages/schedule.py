@@ -36,6 +36,7 @@ STATUS_LABELS = {
 }
 
 FILTERS: list[tuple[str, list[str] | None, bool]] = [
+    ("草稿", ["draft"], False),
     ("今日待檢核", ["pending_review"], True),
     ("今日已排程", ["scheduled"], True),
     ("發布中", ["publishing"], False),
@@ -105,6 +106,10 @@ class ScheduleCenterPage(QWidget):
         view_btn.setObjectName("SecondaryButton")
         view_btn.clicked.connect(self.view_selected)
 
+        submit_draft_btn = QPushButton("送出待檢核")
+        submit_draft_btn.setObjectName("SecondaryButton")
+        submit_draft_btn.clicked.connect(self.submit_draft_selected)
+
         approve_btn = QPushButton("核准排程")
         approve_btn.setObjectName("SecondaryButton")
         approve_btn.clicked.connect(self.approve_selected)
@@ -133,6 +138,7 @@ class ScheduleCenterPage(QWidget):
         toolbar.addWidget(QLabel("篩選："))
         toolbar.addWidget(self.filter_combo)
         toolbar.addWidget(view_btn)
+        toolbar.addWidget(submit_draft_btn)
         toolbar.addWidget(approve_btn)
         toolbar.addWidget(approve_all_btn)
         toolbar.addWidget(reject_btn)
@@ -264,6 +270,33 @@ class ScheduleCenterPage(QWidget):
         layout.addWidget(close_btn)
 
         dialog.exec()
+
+    def submit_draft_selected(self) -> None:
+        row = self.selected()
+        if not row:
+            QMessageBox.information(self, "尚未選擇排程", "請先在列表中選擇一筆排程。")
+            return
+        if row.get("status") != "draft":
+            QMessageBox.warning(self, "無法送出", "只有「草稿」狀態的排程可以送出待檢核。")
+            return
+
+        scheduled_at = str(row.get("scheduled_at") or "").strip()
+        if not scheduled_at:
+            from PySide6.QtCore import QDateTime
+
+            scheduled_at = QDateTime.currentDateTime().addSecs(3 * 3600).toString(
+                "yyyy-MM-dd HH:mm:00"
+            )
+            QMessageBox.information(
+                self,
+                "已自動設定發布時間",
+                f"這筆草稿還沒有設定時間，已先設為 {scheduled_at}，"
+                "核准前仍可以再調整。",
+            )
+
+        self.db.submit_draft(int(row["id"]), scheduled_at)
+        self.refresh()
+        self.status_label.setText(f"已送出待檢核：{row.get('property_title', '')} - {row.get('target_label', '')}")
 
     def approve_selected(self) -> None:
         row = self.selected()

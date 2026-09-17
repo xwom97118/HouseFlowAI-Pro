@@ -26,13 +26,14 @@ from app.pages.strategy import StrategyPage
 from app.pages.sync_center import SyncCenterPage
 from app.services.database import Database
 from app.styles import APP_QSS
+from app.version import APP_NAME, APP_VERSION
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self.setWindowTitle("HouseFlow Professional 3.0.0")
+        self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
         self.resize(1450, 880)
         self.setMinimumSize(1120, 720)
         self.setStyleSheet(APP_QSS)
@@ -56,7 +57,7 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 8, 12, 14)
         side_layout.setSpacing(6)
 
-        brand = QLabel("HouseFlow AI")
+        brand = QLabel(APP_NAME)
         brand.setObjectName("Brand")
         side_layout.addWidget(brand)
 
@@ -72,7 +73,7 @@ class MainWindow(QMainWindow):
             ("ai", "🤖  AI 文案"),
             ("crm", "👥  CRM"),
             ("strategy", "🤝  成交策略"),
-            ("schedule", "📅  排程發布"),
+            ("schedule", "📅  排程管理"),
             ("analytics", "📈  分析"),
             ("settings", "⚙  設定"),
         ]
@@ -94,11 +95,29 @@ class MainWindow(QMainWindow):
 
         side_layout.addStretch()
 
-        user = QLabel("黃冠嘉\n龍潭成交策略")
-        user.setStyleSheet(
-            "color:#94A3B8;padding:12px;"
-        )
-        side_layout.addWidget(user)
+        footer = QFrame()
+        footer.setObjectName("SidebarFooter")
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(12, 10, 12, 4)
+        footer_layout.setSpacing(2)
+
+        self.sidebar_user_label = QLabel("")
+        self.sidebar_user_label.setObjectName("SidebarUser")
+
+        version_row = QHBoxLayout()
+        version_row.setSpacing(6)
+        version_label = QLabel(f"{APP_NAME}\nv{APP_VERSION}")
+        version_label.setObjectName("SidebarVersion")
+        status_label = QLabel("● Ready")
+        status_label.setObjectName("SidebarStatus")
+        version_row.addWidget(version_label)
+        version_row.addStretch()
+        version_row.addWidget(status_label)
+
+        footer_layout.addWidget(self.sidebar_user_label)
+        footer_layout.addLayout(version_row)
+
+        side_layout.addWidget(footer)
 
         outer.addWidget(sidebar)
 
@@ -123,7 +142,6 @@ class MainWindow(QMainWindow):
         topbar_layout.addWidget(self.back_button)
         topbar_layout.addWidget(self.page_title)
         topbar_layout.addStretch()
-        topbar_layout.addWidget(QLabel("Professional 2.0"))
 
         right.addWidget(topbar)
 
@@ -151,7 +169,7 @@ class MainWindow(QMainWindow):
             ),
             "poster": PosterPage(
                 self.db,
-                lambda: self.navigate("dashboard"),
+                self.navigate,
             ),
             "groups": GroupsPage(
                 self.db,
@@ -174,6 +192,8 @@ class MainWindow(QMainWindow):
 
         for page in self.pages.values():
             self.stack.addWidget(page)
+
+        self._refresh_sidebar_footer()
 
         self.navigate(
             "dashboard",
@@ -209,6 +229,7 @@ class MainWindow(QMainWindow):
         self.current_key = key
         page = self.pages[key]
 
+        self._refresh_sidebar_footer()
         self.stack.setCurrentWidget(page)
         self.nav_buttons[key].setChecked(True)
 
@@ -221,7 +242,7 @@ class MainWindow(QMainWindow):
             "ai": "AI 文案中心",
             "crm": "CRM",
             "strategy": "成交策略",
-            "schedule": "排程發布中心",
+            "schedule": "排程管理",
             "analytics": "成效分析",
             "settings": "設定",
         }
@@ -272,6 +293,10 @@ class MainWindow(QMainWindow):
 
         self.ai_page.select_property(property_id)
         self.navigate("ai")
+
+    def _refresh_sidebar_footer(self) -> None:
+        display_name = self.db.get_setting("display_name", "").strip()
+        self.sidebar_user_label.setText(display_name or "尚未設定品牌名稱")
 
     def _on_dashboard_relevant_change(self) -> None:
         properties_page = self.pages.get("properties")

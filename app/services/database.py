@@ -180,6 +180,26 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 """
             )
             self.set_default_setting(conn, "ai_enabled", "0")
+            self._seed_default_brand_profile(conn)
+
+    def _seed_default_brand_profile(self, conn: sqlite3.Connection) -> None:
+        """第一次啟動時的品牌／經紀業資訊種子值。只有在該 key 完全沒有
+        值時才會寫入（set_default_setting 用 INSERT OR IGNORE），之後
+        使用者在設定頁改掉的內容永遠不會被這裡覆蓋。之所以在這裡而不是
+        寫死在 copywriting_engine.py，是因為這些是「這台機器目前使用者
+        的資料」，不是程式邏輯，未來其他房仲安裝 HouseFlow 時應該要能
+        完全換成自己的資料，而不必改程式碼。
+        """
+        defaults = {
+            "display_name": "阿嘉",
+            "brand_slogan": "我是阿嘉，幫你更了解你的不動產價值。",
+            "default_hashtags": "#不動產買賣找阿嘉\n#龍潭成交策略",
+            "brokerage_name": "洺城開發企業社",
+            "salesperson_license": "（108）登字第352260號",
+            "broker_license": "（113）南市字第01004號",
+        }
+        for key, value in defaults.items():
+            self.set_default_setting(conn, key, value)
 
     @staticmethod
     def set_default_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
@@ -1021,6 +1041,14 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
     def reject_schedule(self, schedule_id: int) -> None:
         """退回修改：回到草稿，讓使用者重新編輯後再送審。"""
         self._update_schedule(schedule_id, status="draft")
+
+    def submit_draft(self, schedule_id: int, scheduled_at: str) -> None:
+        """把草稿送出待檢核，需要指定發布時間。"""
+        self._update_schedule(
+            schedule_id,
+            status="pending_review",
+            scheduled_at=scheduled_at.strip(),
+        )
 
     def cancel_schedule(self, schedule_id: int) -> None:
         self._update_schedule(schedule_id, status="cancelled")

@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QDateTime, Qt
+from PySide6.QtCore import QDateTime, QTime, Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDateTimeEdit,
@@ -19,9 +20,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.pages.poster import ImagePreviewList
 from app.services.copywriting_engine import AJCopyEngine
 from app.services.database import Database
+from app.widgets.common import ImagePreviewList, PropertySummaryCard
 from app.widgets.property_picker import PropertyPicker
 
 
@@ -291,4 +292,143 @@ class NewScheduleDialog(QDialog):
         QMessageBox.information(
             self, "已建立排程", f"已建立 {self.created_count} 筆待檢核排程，可以到排程中心核准。"
         )
+        self.accept()
+
+
+class AddToScheduleDialog(QDialog):
+    """從發文中心「加入排程」：物件、文案、圖片、發布位置都已經在發文
+    中心選好了，這裡只需要挑發布時間，然後每個發布位置各建立一筆
+    pending_review 排程，copy_text/images 直接用目前已確認的內容存成
+    快照，之後 Settings 改變不會影響這幾筆排程。
+    """
+
+    def __init__(
+        self,
+        db: Database,
+        property_data: dict[str, Any] | None,
+        copy_text: str,
+        image_paths: list[str],
+        targets: list[tuple[str, str]],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self.db = db
+        self.property_data = property_data
+        self.copy_text = copy_text
+        self.image_paths = image_paths
+        self.targets = targets
+        self.created_count = 0
+        self.go_to_schedule_center = False
+
+        self.setWindowTitle("加入排程")
+        self.resize(600, 620)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 18)
+        root.setSpacing(12)
+
+        summary_card = PropertySummaryCard()
+        summary_card.set_property(property_data)
+        root.addWidget(summary_card)
+
+        target_labels = "、".join(label for _, label in targets)
+        info_label = QLabel(
+            f"圖片：{len(image_paths)} 張\n發布位置：{len(targets)} 個（{target_labels}）"
+        )
+        info_label.setWordWrap(True)
+        root.addWidget(info_label)
+
+        root.addWidget(QLabel("文案預覽（唯讀，實際會依此內容建立排程快照）"))
+        content_preview = QPlainTextEdit(copy_text)
+        content_preview.setReadOnly(True)
+        content_preview.setMaximumHeight(160)
+        root.addWidget(content_preview)
+
+        root.addWidget(QLabel("發布時間"))
+        quick_row = QHBoxLayout()
+
+        later_today_button = QPushButton("今天稍後")
+        later_today_button.setObjectName("SecondaryButton")
+        later_today_button.clicked.connect(self._set_later_today)
+
+        tomorrow_morning_button = QPushButton("明天上午")
+        tomorrow_morning_button.setObjectName("SecondaryButton")
+        tomorrow_morning_button.clicked.connect(self._set_tomorrow_morning)
+
+        tomorrow_afternoon_button = QPushButton("明天下午")
+        tomorrow_afternoon_button.setObjectName("SecondaryButton")
+        tomorrow_afternoon_button.clicked.connect(self._set_tomorrow_afternoon)
+
+        quick_row.addWidget(later_today_button)
+        quick_row.addWidget(tomorrow_morning_button)
+        quick_row.addWidget(tomorrow_afternoon_button)
+        quick_row.addStretch()
+        root.addLayout(quick_row)
+
+        time_row = QHBoxLayout()
+        time_row.addWidget(QLabel("自訂時間"))
+        self.scheduled_at_edit = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3 * 3600))
+        self.scheduled_at_edit.setCalendarPopup(True)
+        self.scheduled_at_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
+        time_row.addWidget(self.scheduled_at_edit)
+        time_row.addStretch()
+        root.addLayout(time_row)
+
+        root.addStretch()
+
+        button_row = QHBoxLayout()
+        cancel_button = QPushButton("取消")
+        cancel_button.setObjectName("SecondaryButton")
+        cancel_button.clicked.connect(self.reject)
+
+        create_button = QPushButton("建立排程")
+        create_button.setObjectName("PrimaryButton")
+        create_button.clicked.connect(self._create_schedules)
+
+        button_row.addStretch()
+        button_row.addWidget(cancel_button)
+        button_row.addWidget(create_button)
+        root.addLayout(button_row)
+
+    def _set_later_today(self) -> None:
+        self.scheduled_at_edit.setDateTime(QDateTime.currentDateTime().addSecs(3 * 3600))
+
+    def _set_tomorrow_morning(self) -> None:
+        dt = QDateTime.currentDateTime().addDays(1)
+        dt.setTime(QTime(9, 0))
+        self.scheduled_at_edit.setDateTime(dt)
+
+    def _set_tomorrow_afternoon(self) -> None:
+        dt = QDateTime.currentDateTime().addDays(1)
+        dt.setTime(QTime(14, 0))
+        self.scheduled_at_edit.setDateTime(dt)
+
+    def _create_schedules(self) -> None:
+        scheduled_at = self.scheduled_at_edit.dateTime().toString("yyyy-MM-dd HH:mm:00")
+        property_id = (self.property_data or {}).get("id")
+
+        for target_url, target_label in self.targets:
+            self.db.create_schedule(
+                {
+                    "property_id": property_id,
+                    "platform": "facebook",
+                    "target": target_url,
+                    "target_label": target_label,
+                    "copy_text": self.copy_text,
+                    "images": self.image_paths,
+                    "scheduled_at": scheduled_at,
+                    "status": "pending_review",
+                }
+            )
+
+        self.created_count = len(self.targets)
+
+        result_box = QMessageBox(self)
+        result_box.setWindowTitle("已加入排程")
+        result_box.setText(f"已建立 {self.created_count} 筆待檢核排程。")
+        go_button = result_box.addButton("前往排程中心", QMessageBox.ButtonRole.AcceptRole)
+        result_box.addButton("繼續編輯", QMessageBox.ButtonRole.RejectRole)
+        result_box.exec()
+
+        self.go_to_schedule_center = result_box.clickedButton() == go_button
         self.accept()

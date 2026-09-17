@@ -12,12 +12,22 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from app.services import brand_profile
 from app.services.database import Database
 from app.widgets.common import SectionTitle
+
+
+def _scrollable(inner: QWidget) -> QScrollArea:
+    scroll = QScrollArea()
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+    scroll.setWidget(inner)
+    return scroll
 
 
 class SettingsPage(QWidget):
@@ -28,228 +38,32 @@ class SettingsPage(QWidget):
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 24)
-        root.setSpacing(16)
+        root.setSpacing(14)
 
         root.addWidget(
             SectionTitle(
-                "個人化設定",
-                "設定個人品牌、聯絡方式與預設文案內容。",
+                "設定",
+                "管理個人品牌、經紀業合規資訊與系統設定。",
             )
         )
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-
-        content = QWidget()
-        content_layout = QVBoxLayout(content)
-        content_layout.setContentsMargins(0, 0, 12, 0)
-        content_layout.setSpacing(16)
-
-        scroll.setWidget(content)
-        root.addWidget(scroll, 1)
-
-        basic_group = QGroupBox("基本資料")
-        basic_form = QFormLayout(basic_group)
-
-        self.name = QLineEdit(
-            self.db.get_setting(
-                "agent_name",
-                "黃冠嘉",
-            )
-        )
-        self.display_name = QLineEdit(
-            self.db.get_setting(
-                "display_name",
-                "阿嘉",
-            )
-        )
-        self.company = QLineEdit(
-            self.db.get_setting(
-                "company_name",
-                "台慶不動產",
-            )
-        )
-        self.brand = QLineEdit(
-            self.db.get_setting(
-                "brand",
-                "龍潭成交策略",
-            )
-        )
-        self.service_area = QLineEdit(
-            self.db.get_setting(
-                "service_area",
-                "龍潭、中壢、平鎮、楊梅、新竹",
-            )
-        )
-        self.phone = QLineEdit(
-            self.db.get_setting(
-                "agent_phone",
-                "",
-            )
-        )
-        self.line_id = QLineEdit(
-            self.db.get_setting(
-                "line_id",
-                "",
-            )
-        )
-        self.email = QLineEdit(
-            self.db.get_setting(
-                "agent_email",
-                "",
-            )
-        )
-
-        basic_form.addRow("姓名", self.name)
-        basic_form.addRow("對外稱呼", self.display_name)
-        basic_form.addRow("公司", self.company)
-        basic_form.addRow("品牌名稱", self.brand)
-        basic_form.addRow("服務區域", self.service_area)
-        basic_form.addRow("電話", self.phone)
-        basic_form.addRow("LINE ID", self.line_id)
-        basic_form.addRow("Email", self.email)
-
-        content_layout.addWidget(basic_group)
-
-        brand_group = QGroupBox("品牌與文案")
-        brand_form = QFormLayout(brand_group)
-
-        self.slogan = QPlainTextEdit(
-            self.db.get_setting(
-                "brand_slogan",
-                "我是阿嘉，幫你更了解你的不動產價值。",
-            )
-        )
-        self.slogan.setMaximumHeight(80)
-
-        self.default_cta = QPlainTextEdit(
-            self.db.get_setting(
-                "default_cta",
-                "留言「賞屋」，我把完整照片與物件資料傳給你。",
-            )
-        )
-        self.default_cta.setMaximumHeight(90)
-
-        self.default_hashtags = QPlainTextEdit(
-            self.db.get_setting(
-                "default_hashtags",
-                "#不動產買賣找阿嘉\n#龍潭成交策略",
-            )
-        )
-        self.default_hashtags.setMaximumHeight(110)
-
-        self.video_outro = QPlainTextEdit(
-            self.db.get_setting(
-                "video_outro",
-                "我是阿嘉，幫你更了解你的不動產價值。",
-            )
-        )
-        self.video_outro.setMaximumHeight(80)
-
-        self.copy_style = QComboBox()
-        self.copy_style.addItems(
-            [
-                "親切自然",
-                "專業分析",
-                "成交導向",
-                "簡短直接",
-                "短影音口吻",
-            ]
-        )
-
-        saved_style = self.db.get_setting(
-            "copy_style",
-            "親切自然",
-        )
-        style_index = self.copy_style.findText(
-            saved_style
-        )
-
-        if style_index >= 0:
-            self.copy_style.setCurrentIndex(
-                style_index
-            )
-
-        brand_form.addRow("品牌口號", self.slogan)
-        brand_form.addRow("預設 CTA", self.default_cta)
-        brand_form.addRow("預設 Hashtag", self.default_hashtags)
-        brand_form.addRow("影片結尾", self.video_outro)
-        brand_form.addRow("文案風格", self.copy_style)
-
-        content_layout.addWidget(brand_group)
-
-        facebook_group = QGroupBox("Facebook 設定")
-        facebook_form = QFormLayout(facebook_group)
-
-        self.facebook_name = QLineEdit(
-            self.db.get_setting(
-                "facebook_name",
-                "",
-            )
-        )
-        self.facebook_profile_url = QLineEdit(
-            self.db.get_setting(
-                "facebook_profile_url",
-                "",
-            )
-        )
-
-        facebook_form.addRow(
-            "Facebook 顯示名稱",
-            self.facebook_name,
-        )
-        facebook_form.addRow(
-            "Facebook 個人網址",
-            self.facebook_profile_url,
-        )
-
-        content_layout.addWidget(facebook_group)
-
-        ai_group = QGroupBox("OpenAI（選用）")
-        ai_form = QFormLayout(ai_group)
-
-        self.api_key = QLineEdit(
-            self.db.get_setting(
-                "openai_api_key",
-                "",
-            )
-        )
-        self.api_key.setEchoMode(
-            QLineEdit.EchoMode.Password
-        )
-
-        self.ai_enabled = QCheckBox(
-            "啟用 OpenAI 文案功能"
-        )
-        self.ai_enabled.setChecked(
-            self.db.get_setting(
-                "ai_enabled",
-                "0",
-            ) == "1"
-        )
-
-        ai_note = QLabel(
-            "目前 AJ Copy Engine 不需要 OpenAI；"
-            "只有啟用 AI 功能時才會使用 API Key。"
-        )
-        ai_note.setWordWrap(True)
-        ai_note.setObjectName("MutedLabel")
-
-        ai_form.addRow("OpenAI API Key", self.api_key)
-        ai_form.addRow("AI 狀態", self.ai_enabled)
-        ai_form.addRow("", ai_note)
-
-        content_layout.addWidget(ai_group)
-
-        content_layout.addStretch()
+        tabs = QTabWidget()
+        tabs.addTab(self._build_general_tab(), "一般設定")
+        tabs.addTab(self._build_brand_tab(), "品牌與經紀業資訊")
+        tabs.addTab(self._build_social_tab(), "社群帳號")
+        tabs.addTab(self._build_ai_tab(), "AI 文案設定")
+        tabs.addTab(self._build_placeholder_tab(
+            "同步來源、自動同步排程與同步頻率設定，請至左側「同步中心」管理。"
+        ), "同步設定")
+        tabs.addTab(self._build_placeholder_tab(
+            "排程狀態、核准與發布紀錄，請至左側「排程管理」管理。"
+        ), "排程設定")
+        root.addWidget(tabs, 1)
 
         button_row = QHBoxLayout()
-
         reset_button = QPushButton("恢復預設")
         reset_button.setObjectName("SecondaryButton")
-        reset_button.clicked.connect(
-            self.reset_defaults
-        )
+        reset_button.clicked.connect(self.reset_defaults)
 
         save_button = QPushButton("儲存設定")
         save_button.setObjectName("PrimaryButton")
@@ -258,83 +72,293 @@ class SettingsPage(QWidget):
         button_row.addStretch()
         button_row.addWidget(reset_button)
         button_row.addWidget(save_button)
-
         root.addLayout(button_row)
+
+    # ------------------------------------------------------------------
+    # 一般設定
+    # ------------------------------------------------------------------
+
+    def _build_general_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 12, 12, 0)
+        layout.setSpacing(16)
+
+        group = QGroupBox("基本資料")
+        form = QFormLayout(group)
+
+        self.name = QLineEdit(self.db.get_setting("agent_name", ""))
+        self.company = QLineEdit(self.db.get_setting("company_name", ""))
+        self.video_outro = QPlainTextEdit(self.db.get_setting("video_outro", ""))
+        self.video_outro.setMaximumHeight(80)
+
+        form.addRow("姓名", self.name)
+        form.addRow("公司", self.company)
+        form.addRow("短影音結尾文字", self.video_outro)
+
+        layout.addWidget(group)
+        layout.addStretch()
+
+        return _scrollable(content)
+
+    # ------------------------------------------------------------------
+    # 品牌與經紀業資訊
+    # ------------------------------------------------------------------
+
+    def _build_brand_tab(self) -> QWidget:
+        content = QWidget()
+        outer = QHBoxLayout(content)
+        outer.setContentsMargins(0, 12, 12, 0)
+        outer.setSpacing(16)
+
+        form_container = QWidget()
+        form_layout = QVBoxLayout(form_container)
+        form_layout.setContentsMargins(0, 0, 0, 0)
+        form_layout.setSpacing(16)
+
+        brand_group = QGroupBox("品牌資料")
+        brand_form = QFormLayout(brand_group)
+
+        self.display_name = QLineEdit(self.db.get_setting("display_name", ""))
+        self.service_area = QLineEdit(self.db.get_setting("service_area", ""))
+        self.slogan = QPlainTextEdit(self.db.get_setting("brand_slogan", ""))
+        self.slogan.setMaximumHeight(70)
+        self.phone = QLineEdit(self.db.get_setting("agent_phone", ""))
+        self.line_id = QLineEdit(self.db.get_setting("line_id", ""))
+        self.email = QLineEdit(self.db.get_setting("agent_email", ""))
+        self.default_cta = QPlainTextEdit(self.db.get_setting("default_cta", ""))
+        self.default_cta.setMaximumHeight(80)
+        self.default_hashtags = QPlainTextEdit(self.db.get_setting("default_hashtags", ""))
+        self.default_hashtags.setMaximumHeight(90)
+
+        brand_form.addRow("顯示名稱／個人品牌", self.display_name)
+        brand_form.addRow("服務區域", self.service_area)
+        brand_form.addRow("品牌標語", self.slogan)
+        brand_form.addRow("電話", self.phone)
+        brand_form.addRow("LINE", self.line_id)
+        brand_form.addRow("Email", self.email)
+        brand_form.addRow("預設 CTA", self.default_cta)
+        brand_form.addRow("預設 Hashtag", self.default_hashtags)
+
+        form_layout.addWidget(brand_group)
+
+        brokerage_group = QGroupBox("不動產經紀業資訊（會自動加入所有物件貼文）")
+        brokerage_form = QFormLayout(brokerage_group)
+
+        self.brokerage_name = QLineEdit(self.db.get_setting("brokerage_name", ""))
+        self.salesperson_name = QLineEdit(self.db.get_setting("salesperson_name", ""))
+        self.salesperson_license = QLineEdit(self.db.get_setting("salesperson_license", ""))
+        self.broker_name = QLineEdit(self.db.get_setting("broker_name", ""))
+        self.broker_license = QLineEdit(self.db.get_setting("broker_license", ""))
+        self.company_address = QLineEdit(self.db.get_setting("company_address", ""))
+        self.company_phone = QLineEdit(self.db.get_setting("company_phone", ""))
+
+        brokerage_form.addRow("經紀業名稱＊", self.brokerage_name)
+        brokerage_form.addRow("營業員姓名", self.salesperson_name)
+        brokerage_form.addRow("營業員證號＊", self.salesperson_license)
+        brokerage_form.addRow("經紀人姓名", self.broker_name)
+        brokerage_form.addRow("經紀人證號＊", self.broker_license)
+        brokerage_form.addRow("公司地址", self.company_address)
+        brokerage_form.addRow("公司電話", self.company_phone)
+
+        note = QLabel(
+            "＊ 標示欄位為必填。物件貼文（立即發布或加入排程）會先檢查這三項是否\n"
+            "已填寫，未完成前無法發布，避免漏掉法定應揭露資訊。"
+        )
+        note.setObjectName("MutedLabel")
+        note.setWordWrap(True)
+        brokerage_form.addRow("", note)
+
+        form_layout.addWidget(brokerage_group)
+        form_layout.addStretch()
+
+        outer.addWidget(form_container, 3)
+
+        preview_group = QGroupBox("發文資訊預覽")
+        preview_layout = QVBoxLayout(preview_group)
+        self.brand_preview = QPlainTextEdit()
+        self.brand_preview.setReadOnly(True)
+        self.brand_preview.setPlaceholderText("填寫左側欄位後，這裡會即時顯示物件貼文結尾會自動加入的內容。")
+        preview_layout.addWidget(self.brand_preview)
+        outer.addWidget(preview_group, 2)
+
+        for widget in (
+            self.display_name, self.service_area, self.phone, self.line_id, self.email,
+            self.brokerage_name, self.salesperson_name, self.salesperson_license,
+            self.broker_name, self.broker_license,
+        ):
+            widget.textChanged.connect(self._refresh_brand_preview)
+        for widget in (self.slogan, self.default_cta, self.default_hashtags):
+            widget.textChanged.connect(self._refresh_brand_preview)
+
+        self._refresh_brand_preview()
+
+        return _scrollable(content)
+
+    def _refresh_brand_preview(self) -> None:
+        profile = {
+            "brokerage_name": self.brokerage_name.text().strip(),
+            "salesperson_name": self.salesperson_name.text().strip(),
+            "salesperson_license": self.salesperson_license.text().strip(),
+            "broker_name": self.broker_name.text().strip(),
+            "broker_license": self.broker_license.text().strip(),
+        }
+        footer = brand_profile.format_compliance_footer(profile)
+        hashtags = self.default_hashtags.toPlainText().strip()
+
+        lines: list[str] = []
+        if footer:
+            lines.append(footer)
+        else:
+            missing = brand_profile.missing_compliance_labels(profile)
+            lines.append(f"（經紀業資訊尚未完整，缺少：{'、'.join(missing)}）")
+
+        if hashtags:
+            lines.append("")
+            lines.append(hashtags)
+
+        self.brand_preview.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    # 社群帳號
+    # ------------------------------------------------------------------
+
+    def _build_social_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 12, 12, 0)
+        layout.setSpacing(16)
+
+        group = QGroupBox("Facebook")
+        form = QFormLayout(group)
+
+        self.facebook_name = QLineEdit(self.db.get_setting("facebook_name", ""))
+        self.facebook_profile_url = QLineEdit(self.db.get_setting("facebook_profile_url", ""))
+
+        form.addRow("Facebook 顯示名稱", self.facebook_name)
+        form.addRow("Facebook 個人網址", self.facebook_profile_url)
+
+        layout.addWidget(group)
+        layout.addStretch()
+
+        return _scrollable(content)
+
+    # ------------------------------------------------------------------
+    # AI 文案設定
+    # ------------------------------------------------------------------
+
+    def _build_ai_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 12, 12, 0)
+        layout.setSpacing(16)
+
+        style_group = QGroupBox("文案風格")
+        style_form = QFormLayout(style_group)
+
+        self.copy_style = QComboBox()
+        self.copy_style.addItems(["親切自然", "專業分析", "成交導向", "簡短直接", "短影音口吻"])
+        saved_style = self.db.get_setting("copy_style", "親切自然")
+        style_index = self.copy_style.findText(saved_style)
+        if style_index >= 0:
+            self.copy_style.setCurrentIndex(style_index)
+        style_form.addRow("文案風格", self.copy_style)
+        layout.addWidget(style_group)
+
+        ai_group = QGroupBox("OpenAI（選用）")
+        ai_form = QFormLayout(ai_group)
+
+        self.api_key = QLineEdit(self.db.get_setting("openai_api_key", ""))
+        self.api_key.setEchoMode(QLineEdit.EchoMode.Password)
+
+        self.ai_enabled = QCheckBox("啟用 OpenAI 文案功能")
+        self.ai_enabled.setChecked(self.db.get_setting("ai_enabled", "0") == "1")
+
+        ai_note = QLabel("目前 AJ Copy Engine 不需要 OpenAI；只有啟用 AI 功能時才會使用 API Key。")
+        ai_note.setWordWrap(True)
+        ai_note.setObjectName("MutedLabel")
+
+        ai_form.addRow("OpenAI API Key", self.api_key)
+        ai_form.addRow("AI 狀態", self.ai_enabled)
+        ai_form.addRow("", ai_note)
+
+        layout.addWidget(ai_group)
+        layout.addStretch()
+
+        return _scrollable(content)
+
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_placeholder_tab(message: str) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 24, 12, 0)
+        label = QLabel(message)
+        label.setObjectName("MutedLabel")
+        label.setWordWrap(True)
+        layout.addWidget(label)
+        layout.addStretch()
+        return content
+
+    # ------------------------------------------------------------------
 
     def save(self) -> None:
         settings = {
             "agent_name": self.name.text().strip(),
-            "display_name": self.display_name.text().strip(),
             "company_name": self.company.text().strip(),
-            "brand": self.brand.text().strip(),
+            "video_outro": self.video_outro.toPlainText().strip(),
+            "display_name": self.display_name.text().strip(),
             "service_area": self.service_area.text().strip(),
+            "brand_slogan": self.slogan.toPlainText().strip(),
             "agent_phone": self.phone.text().strip(),
             "line_id": self.line_id.text().strip(),
             "agent_email": self.email.text().strip(),
-            "brand_slogan": self.slogan.toPlainText().strip(),
             "default_cta": self.default_cta.toPlainText().strip(),
             "default_hashtags": self.default_hashtags.toPlainText().strip(),
-            "video_outro": self.video_outro.toPlainText().strip(),
-            "copy_style": self.copy_style.currentText(),
+            "brokerage_name": self.brokerage_name.text().strip(),
+            "salesperson_name": self.salesperson_name.text().strip(),
+            "salesperson_license": self.salesperson_license.text().strip(),
+            "broker_name": self.broker_name.text().strip(),
+            "broker_license": self.broker_license.text().strip(),
+            "company_address": self.company_address.text().strip(),
+            "company_phone": self.company_phone.text().strip(),
             "facebook_name": self.facebook_name.text().strip(),
             "facebook_profile_url": self.facebook_profile_url.text().strip(),
+            "copy_style": self.copy_style.currentText(),
             "openai_api_key": self.api_key.text().strip(),
-            "ai_enabled": (
-                "1"
-                if self.ai_enabled.isChecked()
-                else "0"
-            ),
+            "ai_enabled": "1" if self.ai_enabled.isChecked() else "0",
         }
 
         for key, value in settings.items():
-            self.db.set_setting(
-                key,
-                value,
-            )
+            self.db.set_setting(key, value)
 
-        QMessageBox.information(
-            self,
-            "儲存完成",
-            "個人化設定已儲存。",
-        )
+        QMessageBox.information(self, "儲存完成", "設定已儲存。")
 
     def reset_defaults(self) -> None:
         answer = QMessageBox.question(
             self,
             "恢復預設",
-            "確定要恢復預設內容嗎？",
-            QMessageBox.StandardButton.Yes
-            | QMessageBox.StandardButton.No,
+            "確定要清空這些欄位嗎？（不會自動還原成最初的種子資料）",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-
         if answer != QMessageBox.StandardButton.Yes:
             return
 
-        self.name.setText("")
-        self.display_name.setText("")
-        self.company.setText("")
-        self.brand.setText("")
-        self.service_area.setText("")
-        self.phone.setText("")
-        self.line_id.setText("")
-        self.email.setText("")
-        self.slogan.setPlainText("")
-        self.default_cta.setPlainText(
-            "留言「賞屋」，我把完整照片與物件資料傳給你。"
-        )
-        self.default_hashtags.setPlainText("")
-        self.video_outro.setPlainText("")
-        self.copy_style.setCurrentText(
-            "親切自然"
-        )
-        self.facebook_name.setText("")
-        self.facebook_profile_url.setText("")
-        self.api_key.setText("")
+        for widget in (
+            self.name, self.company, self.display_name, self.service_area,
+            self.phone, self.line_id, self.email, self.brokerage_name,
+            self.salesperson_name, self.salesperson_license, self.broker_name,
+            self.broker_license, self.company_address, self.company_phone,
+            self.facebook_name, self.facebook_profile_url, self.api_key,
+        ):
+            widget.setText("")
+
+        for widget in (self.video_outro, self.slogan, self.default_cta, self.default_hashtags):
+            widget.setPlainText("")
+
+        self.copy_style.setCurrentText("親切自然")
         self.ai_enabled.setChecked(False)
 
-        QMessageBox.information(
-            self,
-            "已恢復預設",
-            "請確認內容後按「儲存設定」。",
-        )
+        QMessageBox.information(self, "已清空", "請確認內容後按「儲存設定」。")
