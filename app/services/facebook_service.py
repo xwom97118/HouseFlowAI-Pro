@@ -13,16 +13,12 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+from app.services import app_paths
+
 
 class FacebookService:
     def __init__(self) -> None:
-        self.profile_dir = Path(
-            "data/facebook_browser_profile"
-        )
-        self.profile_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        self.profile_dir = app_paths.facebook_profile_dir()
 
     def open_login(self) -> None:
         self.open_target(

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import sys
-from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 from app.main_window import MainWindow
+from app.services import app_paths
 
 
 def run() -> None:
@@ -23,7 +23,7 @@ def run() -> None:
     except Exception:
         pass
 
-    Path("data").mkdir(exist_ok=True)
+    app_paths.data_root()
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

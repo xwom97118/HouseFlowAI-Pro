@@ -4,18 +4,14 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
 
+from app.services import app_paths
 from app.services.http_client import build_session, fetch_html_playwright
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROPERTY_IMAGE_ROOT = PROJECT_ROOT / "data" / "property_images"
 
 
 @dataclass
@@ -43,10 +39,8 @@ class UniversalPropertyImportService:
     MAX_IMAGES = 20
 
     def __init__(self) -> None:
-        PROPERTY_IMAGE_ROOT.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        # property_images_dir() 已經會自動建立資料夾。
+        app_paths.property_images_dir()
         self.session = self._create_session()
 
     def import_url(
@@ -1055,7 +1049,7 @@ class UniversalPropertyImportService:
             ).hexdigest()[:16]
         )
         target_dir = (
-            PROPERTY_IMAGE_ROOT
+            app_paths.property_images_dir()
             / folder_name
         )
         target_dir.mkdir(

@@ -6,7 +6,6 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlparse
 
@@ -14,11 +13,8 @@ import requests
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
+from app.services import app_paths
 from app.services.http_client import build_session
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PROPERTY_IMAGE_ROOT = PROJECT_ROOT / "data" / "property_images"
 
 
 @dataclass
@@ -47,10 +43,8 @@ class YungchingSyncService:
         self._thread_local = threading.local()
         self.session = self._create_session()
 
-        PROPERTY_IMAGE_ROOT.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
+        # property_images_dir() 已經會自動建立資料夾。
+        app_paths.property_images_dir()
 
     def _create_session(self) -> requests.Session:
         # 與 universal_import_service 共用同一套 certifi CA /
@@ -927,7 +921,7 @@ class YungchingSyncService:
             ).hexdigest()[:16]
         )
 
-        target_dir = PROPERTY_IMAGE_ROOT / folder_name
+        target_dir = app_paths.property_images_dir() / folder_name
         target_dir.mkdir(
             parents=True,
             exist_ok=True,

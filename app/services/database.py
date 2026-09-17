@@ -4,11 +4,12 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-DB_PATH = Path(__file__).resolve().parents[2] / "data" / "houseflow.db"
+from app.services import app_paths
 
 
 class Database:
-    def __init__(self, path: Path = DB_PATH) -> None:
+    def __init__(self, path: Path | None = None) -> None:
+        path = path if path is not None else app_paths.db_path()
         self.path = path
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
