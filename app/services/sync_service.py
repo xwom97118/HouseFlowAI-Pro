@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ssl
 import re
 import threading
 import time
@@ -11,12 +10,11 @@ from pathlib import Path
 from typing import Callable
 from urllib.parse import urljoin, urlparse
 
-import certifi
 import requests
-from requests.adapters import HTTPAdapter
 from playwright.sync_api import sync_playwright
-from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
+
+from app.services.http_client import build_session
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -39,30 +37,6 @@ class SyncResult:
 
 
 
-class RelaxedTLSAdapter(HTTPAdapter):
-    """保留憑證驗證，但關閉 Python 3.14 的 X509 strict 模式。"""
-
-    def __init__(self, *args, **kwargs) -> None:
-        self.ssl_context = ssl.create_default_context(cafile=certifi.where())
-        strict_flag = getattr(ssl, "VERIFY_X509_STRICT", 0)
-        if strict_flag:
-            self.ssl_context.verify_flags &= ~strict_flag
-        super().__init__(*args, **kwargs)
-
-    def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
-        pool_kwargs["ssl_context"] = self.ssl_context
-        return super().init_poolmanager(
-            connections,
-            maxsize,
-            block=block,
-            **pool_kwargs,
-        )
-
-    def proxy_manager_for(self, proxy, **proxy_kwargs):
-        proxy_kwargs["ssl_context"] = self.ssl_context
-        return super().proxy_manager_for(proxy, **proxy_kwargs)
-
-
 class YungchingSyncService:
     """從永慶／台慶店頭列表頁擷取物件資料及物件照片。"""
 
@@ -72,20 +46,6 @@ class YungchingSyncService:
     def __init__(self) -> None:
         self._thread_local = threading.local()
         self.session = self._create_session()
-        self.session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/150.0 Safari/537.36"
-                ),
-                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;"
-                    "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-                ),
-            }
-        )
 
         PROPERTY_IMAGE_ROOT.mkdir(
             parents=True,
@@ -93,41 +53,15 @@ class YungchingSyncService:
         )
 
     def _create_session(self) -> requests.Session:
-        session = requests.Session()
-        session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/150.0 Safari/537.36"
-                ),
-                "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;"
-                    "q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
-                ),
-            }
-        )
-
-        retry = Retry(
-            total=3,
-            connect=3,
-            read=3,
-            status=3,
-            backoff_factor=0.6,
-            status_forcelist=(429, 500, 502, 503, 504),
-            allowed_methods=frozenset({"GET"}),
-            raise_on_status=False,
-        )
-        adapter = RelaxedTLSAdapter(
-            max_retries=retry,
+        # 與 universal_import_service 共用同一套 certifi CA /
+        # RelaxedTLSAdapter / retry 設定（見 http_client.py），
+        # 這裡沿用原本已經驗證成功的 pool size 與 retry 參數。
+        return build_session(
             pool_connections=40,
             pool_maxsize=40,
+            retry_total=3,
+            backoff_factor=0.6,
         )
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-
-        return session
 
     def _get_session(self) -> requests.Session:
         session = getattr(

@@ -71,6 +71,16 @@ if not exist "app\services\browser_runtime.py" (
     goto :failed
 )
 
+if not exist "app\services\http_client.py" (
+    echo ERROR: app\services\http_client.py is missing.
+    goto :failed
+)
+
+if not exist "app\services\import_runner.py" (
+    echo ERROR: app\services\import_runner.py is missing.
+    goto :failed
+)
+
 if not exist "houseflow_version_info.txt" (
     echo ERROR: houseflow_version_info.txt is missing.
     goto :failed
@@ -136,6 +146,8 @@ python -m PyInstaller ^
   --hidden-import "app.services.sync_service" ^
   --hidden-import "app.services.sync_runner" ^
   --hidden-import "app.services.browser_runtime" ^
+  --hidden-import "app.services.http_client" ^
+  --hidden-import "app.services.import_runner" ^
   --hidden-import "app.services.facebook_service" ^
   --hidden-import "app.services.copywriting_engine" ^
   --hidden-import "app.services.universal_import_service" ^

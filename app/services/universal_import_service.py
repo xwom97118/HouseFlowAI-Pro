@@ -5,14 +5,13 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urljoin, urlparse
 
-import certifi
 import requests
 from bs4 import BeautifulSoup
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+
+from app.services.http_client import build_session, fetch_html_playwright
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -53,6 +52,7 @@ class UniversalPropertyImportService:
     def import_url(
         self,
         url: str,
+        progress_callback: Callable[[dict], None] | None = None,
     ) -> UniversalImportResult:
         url = url.strip()
 
@@ -61,19 +61,92 @@ class UniversalPropertyImportService:
                 "網址格式不正確，必須以 http:// 或 https:// 開頭。"
             )
 
-        response = self.session.get(
-            url,
-            timeout=45,
-        )
-        response.raise_for_status()
-        response.encoding = (
-            response.apparent_encoding
-            or response.encoding
-            or "utf-8"
+        self._notify(progress_callback, "fetch", "正在讀取物件頁面…")
+
+        html, used_playwright = self._fetch_html(url)
+
+        self._notify(progress_callback, "parse", "正在解析物件資料…")
+        property_data, source_name, found_fields = self._parse_property(
+            html=html,
+            url=url,
         )
 
+        if found_fields <= 1 and not used_playwright:
+            # requests 抓到的頁面資料太少，通常代表該站靠 JavaScript
+            # 動態載入內容；改用 HouseFlow 隨附的 Chromium 重新渲染一次。
+            self._notify(progress_callback, "fetch", "頁面資料不足，改用內建瀏覽器重新讀取…")
+            html = fetch_html_playwright(url)
+            used_playwright = True
+            self._notify(progress_callback, "parse", "正在解析物件資料…")
+            property_data, source_name, found_fields = self._parse_property(
+                html=html,
+                url=url,
+            )
+
+        if found_fields <= 1:
+            raise RuntimeError(
+                "網址可以開啟，但頁面可辨識的物件資料太少。"
+                "該網站可能使用動態載入、登入限制或防爬機制。"
+            )
+
+        self._notify(progress_callback, "images", "正在下載照片…")
+        image_paths = self._download_images(
+            property_data=property_data,
+            image_urls=property_data.get("image_urls", []),
+        )
+        property_data["image_paths"] = image_paths
+        property_data["image_count"] = len(image_paths)
+
+        self._notify(progress_callback, "done", "匯入完成")
+
+        return UniversalImportResult(
+            property_data=property_data,
+            source_name=source_name,
+            message=(
+                f"已從「{source_name}」讀取單一物件："
+                f"{property_data['title']}，"
+                f"下載 {len(image_paths)} 張照片。"
+                + ("（使用內建瀏覽器渲染）" if used_playwright else "")
+            ),
+        )
+
+    def _fetch_html(self, url: str) -> tuple[str, bool]:
+        """優先用 requests 快速抓取；連線／SSL／逾時失敗時，改用
+        HouseFlow 隨附的 Chromium（browser_runtime.py）重新渲染頁面。
+        回傳 (html, used_playwright)。
+        """
+        try:
+            response = self.session.get(url, timeout=45)
+            response.raise_for_status()
+            response.encoding = (
+                response.apparent_encoding
+                or response.encoding
+                or "utf-8"
+            )
+            return response.text, False
+        except requests.exceptions.RequestException:
+            return fetch_html_playwright(url), True
+
+    @staticmethod
+    def _notify(
+        callback: Callable[[dict], None] | None,
+        stage: str,
+        message: str,
+    ) -> None:
+        if callback is None:
+            return
+        try:
+            callback({"stage": stage, "message": message})
+        except Exception:
+            pass
+
+    def _parse_property(
+        self,
+        html: str,
+        url: str,
+    ) -> tuple[dict[str, Any], str, int]:
         soup = BeautifulSoup(
-            response.text,
+            html,
             "lxml",
         )
         page_text = self._clean_text(
@@ -130,7 +203,7 @@ class UniversalPropertyImportService:
             soup=soup,
             json_ld_items=json_ld_items,
             base_url=url,
-            html=response.text,
+            html=html,
         )
 
         property_data: dict[str, Any] = {
@@ -150,15 +223,6 @@ class UniversalPropertyImportService:
             "image_urls": image_urls,
         }
 
-        image_paths = self._download_images(
-            property_data=property_data,
-            image_urls=image_urls,
-        )
-        property_data["image_paths"] = image_paths
-        property_data["image_count"] = len(
-            image_paths
-        )
-
         found_fields = sum(
             bool(property_data.get(key))
             for key in (
@@ -170,71 +234,22 @@ class UniversalPropertyImportService:
             )
         )
 
-        if found_fields <= 1:
-            raise RuntimeError(
-                "網址可以開啟，但頁面可辨識的物件資料太少。"
-                "該網站可能使用動態載入、登入限制或防爬機制。"
-            )
-
-        return UniversalImportResult(
-            property_data=property_data,
-            source_name=source_name,
-            message=(
-                f"已從「{source_name}」讀取單一物件："
-                f"{property_data['title']}，"
-                f"下載 {len(image_paths)} 張照片。"
-            ),
-        )
+        return property_data, source_name, found_fields
 
     def _create_session(
         self,
     ) -> requests.Session:
-        session = requests.Session()
-        session.verify = certifi.where()
-        session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/150.0 Safari/537.36"
-                ),
-                "Accept-Language": (
-                    "zh-TW,zh;q=0.9,en;q=0.8"
-                ),
-                "Accept": (
-                    "text/html,application/xhtml+xml,"
-                    "application/xml;q=0.9,image/avif,"
-                    "image/webp,image/apng,*/*;q=0.8"
-                ),
-                "Connection": "keep-alive",
-            }
-        )
-
-        retry = Retry(
-            total=4,
-            connect=4,
-            read=4,
-            status=4,
-            backoff_factor=0.8,
-            status_forcelist=(
-                429,
-                500,
-                502,
-                503,
-                504,
-            ),
-            allowed_methods=frozenset({"GET"}),
-            raise_on_status=False,
-        )
-        adapter = HTTPAdapter(
-            max_retries=retry,
+        # 與 sync_service（整店同步）共用同一套 certifi CA /
+        # RelaxedTLSAdapter / retry 設定（見 http_client.py），
+        # 解決 Python 3.14 對缺少 Subject Key Identifier 憑證鏈的
+        # strict X509 檢查（例如 buy.yungching.com.tw 單一物件頁）。
+        return build_session(
             pool_connections=20,
             pool_maxsize=20,
+            retry_total=4,
+            backoff_factor=0.8,
+            extra_headers={"Connection": "keep-alive"},
         )
-        session.mount("https://", adapter)
-        session.mount("http://", adapter)
-
-        return session
 
     @staticmethod
     def _detect_source(

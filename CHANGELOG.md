@@ -1,3 +1,21 @@
+# 3.1.1 Universal Import SSL fix
+
+- 修正「匯入單一物件網址」在 Python 3.14 對缺少 Subject Key
+  Identifier 的憑證鏈（例如 buy.yungching.com.tw）觸發
+  SSLCertVerificationError 的問題。整店同步先前已經用
+  RelaxedTLSAdapter 解決過同一個問題，現在抽成共用元件
+  app/services/http_client.py，單一物件匯入與整店同步共用同一套
+  certifi CA / SSL / retry / connection pooling 設定，不使用
+  verify=False。
+- 單一物件匯入新增 Playwright fallback（HTTP 抓不到或資料太少時，
+  改用 HouseFlow 隨附的 Chromium 渲染），並在單一物件匯入情境下
+  重複使用同一個瀏覽器行程，不必每次匯入都重新啟動；整店同步的
+  Playwright fallback（多執行緒併發）維持原本各自獨立啟動，避免
+  跨執行緒共用瀏覽器造成的執行緒安全風險。
+- 單一物件匯入改為背景 QThread 執行，畫面顯示「正在讀取物件頁面…
+  → 正在解析物件資料… → 正在下載照片… → 匯入完成」，不再卡住畫面。
+- 重複匯入同一網址會更新既有物件，不會產生重複物件。
+
 # 3.1 Sync Center
 
 - 新增獨立「同步中心」頁面：管理多個同步來源、立即同步、同步歷史。
