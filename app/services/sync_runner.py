@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 
-from PySide6.QtCore import QObject, QThread, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QThread, Signal
 
 from app.services.database import Database
 from app.services.sync_service import YungchingSyncService
@@ -43,6 +43,13 @@ class SyncRunner(QObject):
         if self._qthread is None:
             return
         self._qthread.wait(timeout_ms)
+
+        # 搬回主執行緒再排入刪除，避免物件卡在一個事件迴圈已經停止的
+        # QThread 上（deleteLater 需要物件自己所屬執行緒的事件迴圈處理）。
+        app = QCoreApplication.instance()
+        if app is not None:
+            self.moveToThread(app.thread())
+
         self.deleteLater()
         self._qthread.deleteLater()
 

@@ -147,6 +147,36 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
 
                 CREATE INDEX IF NOT EXISTS idx_sync_runs_source
                 ON sync_runs(source_id);
+
+                CREATE TABLE IF NOT EXISTS schedules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    property_id INTEGER,
+                    platform TEXT NOT NULL DEFAULT 'facebook',
+                    target TEXT NOT NULL DEFAULT '',
+                    target_label TEXT NOT NULL DEFAULT '',
+                    copy_text TEXT NOT NULL DEFAULT '',
+                    images TEXT NOT NULL DEFAULT '',
+                    scheduled_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    approved_at TEXT NOT NULL DEFAULT '',
+                    published_at TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'pending_review',
+                    post_url TEXT NOT NULL DEFAULT '',
+                    post_id TEXT NOT NULL DEFAULT '',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY(property_id) REFERENCES properties(id) ON DELETE SET NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_schedules_status
+                ON schedules(status);
+
+                CREATE INDEX IF NOT EXISTS idx_schedules_scheduled_at
+                ON schedules(scheduled_at);
+
+                CREATE INDEX IF NOT EXISTS idx_schedules_property
+                ON schedules(property_id);
                 """
             )
             self.set_default_setting(conn, "ai_enabled", "0")
@@ -866,3 +896,203 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 """,
                 (1 if enabled else 0, group_id),
             )
+
+    # ---------------------------------------------------------------
+    # 排程發布中心（Schedule Center）
+    # ---------------------------------------------------------------
+
+    def create_schedule(self, data: dict[str, Any]) -> int:
+        images_value = data.get("images", [])
+        images = images_value if isinstance(images_value, str) else "\n".join(images_value)
+
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO schedules(
+                    property_id, platform, target, target_label, copy_text,
+                    images, scheduled_at, status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data.get("property_id"),
+                    str(data.get("platform", "facebook")).strip() or "facebook",
+                    str(data.get("target", "")).strip(),
+                    str(data.get("target_label", "")).strip(),
+                    str(data.get("copy_text", "")).strip(),
+                    images,
+                    str(data.get("scheduled_at", "")).strip(),
+                    str(data.get("status", "pending_review")).strip() or "pending_review",
+                ),
+            )
+            return int(cur.lastrowid)
+
+    def get_schedule(self, schedule_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT s.*, p.title AS property_title, p.address AS property_address,
+                       p.external_id AS property_external_id
+                FROM schedules s
+                LEFT JOIN properties p ON p.id = s.property_id
+                WHERE s.id = ?
+                """,
+                (schedule_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def list_schedules(
+        self,
+        statuses: list[str] | None = None,
+        search: str = "",
+        only_today: bool = False,
+        limit: int = 300,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT s.*, p.title AS property_title, p.address AS property_address,
+                   p.external_id AS property_external_id
+            FROM schedules s
+            LEFT JOIN properties p ON p.id = s.property_id
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+
+        if statuses:
+            placeholders = ", ".join("?" for _ in statuses)
+            clauses.append(f"s.status IN ({placeholders})")
+            params.extend(statuses)
+
+        if only_today:
+            clauses.append("date(s.scheduled_at) = date('now', 'localtime')")
+
+        if search:
+            pattern = f"%{search}%"
+            clauses.append(
+                "(p.title LIKE ? OR p.address LIKE ? OR s.target_label LIKE ? OR s.copy_text LIKE ?)"
+            )
+            params.extend([pattern] * 4)
+
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+
+        sql += " ORDER BY CASE WHEN s.scheduled_at='' THEN 1 ELSE 0 END, s.scheduled_at, s.id DESC LIMIT ?"
+        params.append(limit)
+
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
+
+    def _update_schedule(self, schedule_id: int, **fields: Any) -> None:
+        if not fields:
+            return
+        assignments = ", ".join(f"{key}=?" for key in fields)
+        with self.connect() as conn:
+            conn.execute(
+                f"UPDATE schedules SET {assignments}, updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (*fields.values(), schedule_id),
+            )
+
+    def approve_schedule(self, schedule_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules SET status='scheduled', approved_at=CURRENT_TIMESTAMP,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (schedule_id,),
+            )
+
+    def approve_all_pending_today(self) -> int:
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM schedules
+                WHERE status='pending_review' AND date(scheduled_at) = date('now', 'localtime')
+                """
+            ).fetchall()
+            ids = [int(row["id"]) for row in rows]
+            for schedule_id in ids:
+                conn.execute(
+                    "UPDATE schedules SET status='scheduled', approved_at=CURRENT_TIMESTAMP, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (schedule_id,),
+                )
+        return len(ids)
+
+    def reject_schedule(self, schedule_id: int) -> None:
+        """退回修改：回到草稿，讓使用者重新編輯後再送審。"""
+        self._update_schedule(schedule_id, status="draft")
+
+    def cancel_schedule(self, schedule_id: int) -> None:
+        self._update_schedule(schedule_id, status="cancelled")
+
+    def delete_schedule(self, schedule_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute("DELETE FROM schedules WHERE id=?", (schedule_id,))
+
+    def update_schedule_content(
+        self,
+        schedule_id: int,
+        copy_text: str,
+        images: list[str] | str,
+        scheduled_at: str,
+    ) -> None:
+        images_value = images if isinstance(images, str) else "\n".join(images)
+        self._update_schedule(
+            schedule_id,
+            copy_text=copy_text.strip(),
+            images=images_value,
+            scheduled_at=scheduled_at.strip(),
+        )
+
+    def mark_schedule_publishing(self, schedule_id: int) -> None:
+        self._update_schedule(schedule_id, status="publishing")
+
+    def mark_schedule_published(
+        self, schedule_id: int, post_url: str = "", post_id: str = ""
+    ) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules SET status='published', published_at=CURRENT_TIMESTAMP,
+                    post_url=?, post_id=?, error_message='', updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (post_url, post_id, schedule_id),
+            )
+
+    def mark_schedule_failed(self, schedule_id: int, error_message: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules
+                SET status='failed', error_message=?, retry_count=retry_count+1,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (error_message, schedule_id),
+            )
+
+    def schedule_dashboard_counts(self) -> dict[str, int]:
+        with self.connect() as conn:
+            def _count(where: str) -> int:
+                return int(
+                    conn.execute(f"SELECT COUNT(*) FROM schedules WHERE {where}").fetchone()[0]
+                )
+
+            return {
+                "pending_review_today": _count(
+                    "status='pending_review' AND date(scheduled_at) = date('now', 'localtime')"
+                ),
+                "pending_review_total": _count("status='pending_review'"),
+                "scheduled_today": _count(
+                    "status='scheduled' AND date(scheduled_at) = date('now', 'localtime')"
+                ),
+                "publishing": _count("status='publishing'"),
+                "published_today": _count(
+                    "status='published' AND date(published_at, 'localtime') = date('now', 'localtime')"
+                ),
+                "failed_today": _count(
+                    "status='failed' AND date(updated_at, 'localtime') = date('now', 'localtime')"
+                ),
+                "failed_total": _count("status='failed'"),
+            }

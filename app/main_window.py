@@ -20,6 +20,7 @@ from app.pages.groups import GroupsPage
 from app.pages.placeholders import PlaceholderPage
 from app.pages.poster import PosterPage
 from app.pages.properties import PropertiesPage
+from app.pages.schedule import ScheduleCenterPage
 from app.pages.settings import SettingsPage
 from app.pages.strategy import StrategyPage
 from app.pages.sync_center import SyncCenterPage
@@ -71,7 +72,7 @@ class MainWindow(QMainWindow):
             ("ai", "🤖  AI 文案"),
             ("crm", "👥  CRM"),
             ("strategy", "🤝  成交策略"),
-            ("schedule", "📅  排程"),
+            ("schedule", "📅  排程發布"),
             ("analytics", "📈  分析"),
             ("settings", "⚙  設定"),
         ]
@@ -141,7 +142,7 @@ class MainWindow(QMainWindow):
             "sync_center": SyncCenterPage(
                 self.db,
                 lambda: self.navigate("dashboard"),
-                on_synced=self._on_properties_synced,
+                on_synced=self._on_dashboard_relevant_change,
             ),
             "properties": PropertiesPage(
                 self.db,
@@ -159,9 +160,10 @@ class MainWindow(QMainWindow):
             "ai": self.ai_page,
             "crm": CRMPage(self.db),
             "strategy": StrategyPage(self.db),
-            "schedule": PlaceholderPage(
-                "排程中心",
-                "以30分鐘為單位管理Facebook發布時間。",
+            "schedule": ScheduleCenterPage(
+                self.db,
+                lambda: self.navigate("dashboard"),
+                on_published=self._on_dashboard_relevant_change,
             ),
             "analytics": PlaceholderPage(
                 "成效分析",
@@ -219,7 +221,7 @@ class MainWindow(QMainWindow):
             "ai": "AI 文案中心",
             "crm": "CRM",
             "strategy": "成交策略",
-            "schedule": "排程中心",
+            "schedule": "排程發布中心",
             "analytics": "成效分析",
             "settings": "設定",
         }
@@ -271,7 +273,7 @@ class MainWindow(QMainWindow):
         self.ai_page.select_property(property_id)
         self.navigate("ai")
 
-    def _on_properties_synced(self) -> None:
+    def _on_dashboard_relevant_change(self) -> None:
         properties_page = self.pages.get("properties")
         if properties_page is not None and hasattr(properties_page, "refresh"):
             properties_page.refresh()

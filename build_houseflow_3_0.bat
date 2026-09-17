@@ -93,6 +93,21 @@ if not exist "app\services\app_paths.py" (
     goto :failed
 )
 
+if not exist "app\pages\schedule.py" (
+    echo ERROR: app\pages\schedule.py is missing.
+    goto :failed
+)
+
+if not exist "app\services\schedule_runner.py" (
+    echo ERROR: app\services\schedule_runner.py is missing.
+    goto :failed
+)
+
+if not exist "app\widgets\schedule_dialog.py" (
+    echo ERROR: app\widgets\schedule_dialog.py is missing.
+    goto :failed
+)
+
 if not exist "houseflow_version_info.txt" (
     echo ERROR: houseflow_version_info.txt is missing.
     goto :failed
@@ -178,10 +193,13 @@ python -m PyInstaller ^
   --hidden-import "app.services.facebook_service" ^
   --hidden-import "app.services.copywriting_engine" ^
   --hidden-import "app.services.universal_import_service" ^
+  --hidden-import "app.services.schedule_runner" ^
   --hidden-import "app.pages.sync_center" ^
+  --hidden-import "app.pages.schedule" ^
   --hidden-import "app.widgets.common" ^
   --hidden-import "app.widgets.property_picker" ^
   --hidden-import "app.widgets.universal_import_dialog" ^
+  --hidden-import "app.widgets.schedule_dialog" ^
   --add-data "app;app" ^
   --add-data "pw-browsers;pw-browsers" ^
   "main.py" >> "%BUILD_LOG%" 2>&1
