@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "APP_NAME=HouseFlow"
-set "APP_VERSION=3.0.0"
+set "APP_VERSION=3.2.0"
 set "BUILD_LOG=%~dp0HouseFlow_build_log.txt"
 
 REM User data lives in %LOCALAPPDATA%\HouseFlow\ (see app/services/app_paths.py),
@@ -108,6 +108,16 @@ if not exist "app\widgets\schedule_dialog.py" (
     goto :failed
 )
 
+if not exist "app\services\brand_profile.py" (
+    echo ERROR: app\services\brand_profile.py is missing.
+    goto :failed
+)
+
+if not exist "app\version.py" (
+    echo ERROR: app\version.py is missing.
+    goto :failed
+)
+
 if not exist "houseflow_version_info.txt" (
     echo ERROR: houseflow_version_info.txt is missing.
     goto :failed
@@ -196,6 +206,8 @@ python -m PyInstaller ^
   --hidden-import "app.services.schedule_runner" ^
   --hidden-import "app.pages.sync_center" ^
   --hidden-import "app.pages.schedule" ^
+  --hidden-import "app.services.brand_profile" ^
+  --hidden-import "app.version" ^
   --hidden-import "app.widgets.common" ^
   --hidden-import "app.widgets.property_picker" ^
   --hidden-import "app.widgets.universal_import_dialog" ^
