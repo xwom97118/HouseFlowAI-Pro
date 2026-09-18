@@ -4,11 +4,11 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QDateTime, QTime, Qt
+from PySide6.QtCore import QDate, QDateTime, QTime, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
-    QDateTimeEdit,
+    QDateEdit,
     QDialog,
     QFileDialog,
     QGroupBox,
@@ -20,14 +20,102 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSpinBox,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from app.services.copywriting_engine import AJCopyEngine
 from app.services.database import Database
-from app.widgets.common import ImagePreviewList, PropertySummaryCard
+from app.widgets.common import ImagePreviewList, get_thumbnail_icon
 from app.widgets.property_picker import PropertyPicker
+
+
+class ScheduleTimePicker(QWidget):
+    """發布日期＋時間選擇：QDateEdit + QTimeEdit + 快速按鈕，取代讓使用者
+    自己輸入文字時間。預設「今天、目前時間 + 30 分鐘」；選到過去時間會
+    立刻顯示警告，is_valid() 回傳 False 讓呼叫端擋下建立動作。
+    """
+
+    changed = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        row = QHBoxLayout()
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy/MM/dd")
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat("HH:mm")
+        row.addWidget(self.date_edit)
+        row.addWidget(self.time_edit)
+        row.addStretch()
+        layout.addLayout(row)
+
+        quick_row = QHBoxLayout()
+        quick_row.setSpacing(6)
+        for label, minutes in (("+10 分鐘", 10), ("+30 分鐘", 30), ("+1 小時", 60)):
+            button = QPushButton(label)
+            button.setObjectName("SecondaryButton")
+            button.clicked.connect(lambda _=False, m=minutes: self._bump(m))
+            quick_row.addWidget(button)
+
+        today_button = QPushButton("今天")
+        today_button.setObjectName("SecondaryButton")
+        today_button.clicked.connect(lambda: self.date_edit.setDate(QDate.currentDate()))
+        tomorrow_button = QPushButton("明天")
+        tomorrow_button.setObjectName("SecondaryButton")
+        tomorrow_button.clicked.connect(lambda: self.date_edit.setDate(QDate.currentDate().addDays(1)))
+        quick_row.addWidget(today_button)
+        quick_row.addWidget(tomorrow_button)
+        quick_row.addStretch()
+        layout.addLayout(quick_row)
+
+        self.preview_label = QLabel()
+        self.preview_label.setObjectName("Muted")
+        layout.addWidget(self.preview_label)
+
+        self.warning_label = QLabel()
+        self.warning_label.setObjectName("WarningText")
+        self.warning_label.setVisible(False)
+        layout.addWidget(self.warning_label)
+
+        self.date_edit.dateChanged.connect(self._refresh)
+        self.time_edit.timeChanged.connect(self._refresh)
+
+        self.set_default()
+
+    def set_default(self) -> None:
+        dt = QDateTime.currentDateTime().addSecs(30 * 60)
+        self.date_edit.setDate(dt.date())
+        self.time_edit.setTime(QTime(dt.time().hour(), dt.time().minute()))
+        self._refresh()
+
+    def _bump(self, minutes: int) -> None:
+        dt = self.value().addSecs(minutes * 60)
+        self.date_edit.setDate(dt.date())
+        self.time_edit.setTime(dt.time())
+
+    def value(self) -> QDateTime:
+        return QDateTime(self.date_edit.date(), self.time_edit.time())
+
+    def value_str(self) -> str:
+        return self.value().toString("yyyy-MM-dd HH:mm:00")
+
+    def is_valid(self) -> bool:
+        return self.value() >= QDateTime.currentDateTime()
+
+    def _refresh(self, *_args) -> None:
+        dt = self.value()
+        self.preview_label.setText(f"預計發布：{dt.toString('yyyy/MM/dd HH:mm')}")
+        past = dt < QDateTime.currentDateTime()
+        self.warning_label.setText("⚠ 發布時間不能早於目前時間" if past else "")
+        self.warning_label.setVisible(past)
+        self.changed.emit()
 
 
 class DeleteRuleSelector(QWidget):
@@ -173,14 +261,9 @@ class NewScheduleDialog(QDialog):
 
         root.addWidget(target_box)
 
-        schedule_row = QHBoxLayout()
-        schedule_row.addWidget(QLabel("預定發布時間"))
-        self.scheduled_at_edit = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3600))
-        self.scheduled_at_edit.setCalendarPopup(True)
-        self.scheduled_at_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
-        schedule_row.addWidget(self.scheduled_at_edit)
-        schedule_row.addStretch()
-        root.addLayout(schedule_row)
+        root.addWidget(QLabel("預定發布時間"))
+        self.time_picker = ScheduleTimePicker()
+        root.addWidget(self.time_picker)
 
         root.addWidget(QLabel("自動刪除貼文"))
         self.delete_rule = DeleteRuleSelector(db)
@@ -296,16 +379,10 @@ class NewScheduleDialog(QDialog):
             self.image_label.setText("尚未選擇圖片")
             return
 
-        from PySide6.QtGui import QIcon, QPixmap
         from PySide6.QtWidgets import QListWidgetItem
 
         for index, image_path in enumerate(self.image_paths):
-            pixmap = QPixmap(image_path)
-            icon = QIcon() if pixmap.isNull() else QIcon(
-                pixmap.scaled(
-                    150, 110, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-                )
-            )
+            icon = get_thumbnail_icon(image_path)
             prefix = "★ 封面" if index == 0 else f"{index + 1:02d}"
             item = QListWidgetItem(icon, f"{prefix}\n{Path(image_path).name}")
             item.setData(Qt.ItemDataRole.UserRole, image_path)
@@ -349,7 +426,11 @@ class NewScheduleDialog(QDialog):
             QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
             return
 
-        scheduled_at = self.scheduled_at_edit.dateTime().toString("yyyy-MM-dd HH:mm:00")
+        if not self.time_picker.is_valid():
+            QMessageBox.warning(self, "發布時間不正確", "發布時間不能早於目前時間。")
+            return
+
+        scheduled_at = self.time_picker.value_str()
         delete_after_days = self.delete_rule.value()
         batch_id = uuid.uuid4().hex
 
@@ -373,151 +454,4 @@ class NewScheduleDialog(QDialog):
         QMessageBox.information(
             self, "已建立排程", f"已建立 {self.created_count} 筆待檢核排程，可以到排程中心核准。"
         )
-        self.accept()
-
-
-class AddToScheduleDialog(QDialog):
-    """從發文中心「加入排程」：物件、文案、圖片、發布位置都已經在發文
-    中心選好了，這裡只需要挑發布時間，然後每個發布位置各建立一筆
-    pending_review 排程，copy_text/images 直接用目前已確認的內容存成
-    快照，之後 Settings 改變不會影響這幾筆排程。
-    """
-
-    def __init__(
-        self,
-        db: Database,
-        property_data: dict[str, Any] | None,
-        copy_text: str,
-        image_paths: list[str],
-        targets: list[tuple[str, str]],
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self.db = db
-        self.property_data = property_data
-        self.copy_text = copy_text
-        self.image_paths = image_paths
-        self.targets = targets
-        self.created_count = 0
-        self.go_to_schedule_center = False
-
-        self.setWindowTitle("加入排程")
-        self.resize(600, 620)
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(20, 18, 20, 18)
-        root.setSpacing(12)
-
-        summary_card = PropertySummaryCard()
-        summary_card.set_property(property_data)
-        root.addWidget(summary_card)
-
-        target_labels = "、".join(label for _, label in targets)
-        info_label = QLabel(
-            f"圖片：{len(image_paths)} 張\n發布位置：{len(targets)} 個（{target_labels}）"
-        )
-        info_label.setWordWrap(True)
-        root.addWidget(info_label)
-
-        root.addWidget(QLabel("文案預覽（唯讀，實際會依此內容建立排程快照）"))
-        content_preview = QPlainTextEdit(copy_text)
-        content_preview.setReadOnly(True)
-        content_preview.setMaximumHeight(160)
-        root.addWidget(content_preview)
-
-        root.addWidget(QLabel("發布時間"))
-        quick_row = QHBoxLayout()
-
-        later_today_button = QPushButton("今天稍後")
-        later_today_button.setObjectName("SecondaryButton")
-        later_today_button.clicked.connect(self._set_later_today)
-
-        tomorrow_morning_button = QPushButton("明天上午")
-        tomorrow_morning_button.setObjectName("SecondaryButton")
-        tomorrow_morning_button.clicked.connect(self._set_tomorrow_morning)
-
-        tomorrow_afternoon_button = QPushButton("明天下午")
-        tomorrow_afternoon_button.setObjectName("SecondaryButton")
-        tomorrow_afternoon_button.clicked.connect(self._set_tomorrow_afternoon)
-
-        quick_row.addWidget(later_today_button)
-        quick_row.addWidget(tomorrow_morning_button)
-        quick_row.addWidget(tomorrow_afternoon_button)
-        quick_row.addStretch()
-        root.addLayout(quick_row)
-
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("自訂時間"))
-        self.scheduled_at_edit = QDateTimeEdit(QDateTime.currentDateTime().addSecs(3 * 3600))
-        self.scheduled_at_edit.setCalendarPopup(True)
-        self.scheduled_at_edit.setDisplayFormat("yyyy-MM-dd HH:mm")
-        time_row.addWidget(self.scheduled_at_edit)
-        time_row.addStretch()
-        root.addLayout(time_row)
-
-        root.addWidget(QLabel("自動刪除貼文"))
-        self.delete_rule = DeleteRuleSelector(db)
-        root.addWidget(self.delete_rule)
-
-        root.addStretch()
-
-        button_row = QHBoxLayout()
-        cancel_button = QPushButton("取消")
-        cancel_button.setObjectName("SecondaryButton")
-        cancel_button.clicked.connect(self.reject)
-
-        create_button = QPushButton("建立排程")
-        create_button.setObjectName("PrimaryButton")
-        create_button.clicked.connect(self._create_schedules)
-
-        button_row.addStretch()
-        button_row.addWidget(cancel_button)
-        button_row.addWidget(create_button)
-        root.addLayout(button_row)
-
-    def _set_later_today(self) -> None:
-        self.scheduled_at_edit.setDateTime(QDateTime.currentDateTime().addSecs(3 * 3600))
-
-    def _set_tomorrow_morning(self) -> None:
-        dt = QDateTime.currentDateTime().addDays(1)
-        dt.setTime(QTime(9, 0))
-        self.scheduled_at_edit.setDateTime(dt)
-
-    def _set_tomorrow_afternoon(self) -> None:
-        dt = QDateTime.currentDateTime().addDays(1)
-        dt.setTime(QTime(14, 0))
-        self.scheduled_at_edit.setDateTime(dt)
-
-    def _create_schedules(self) -> None:
-        scheduled_at = self.scheduled_at_edit.dateTime().toString("yyyy-MM-dd HH:mm:00")
-        property_id = (self.property_data or {}).get("id")
-        delete_after_days = self.delete_rule.value()
-        batch_id = uuid.uuid4().hex
-
-        for target_url, target_label in self.targets:
-            self.db.create_schedule(
-                {
-                    "property_id": property_id,
-                    "platform": "facebook",
-                    "target": target_url,
-                    "target_label": target_label,
-                    "copy_text": self.copy_text,
-                    "images": self.image_paths,
-                    "scheduled_at": scheduled_at,
-                    "status": "pending_review",
-                    "batch_id": batch_id,
-                    "delete_after_days": delete_after_days,
-                }
-            )
-
-        self.created_count = len(self.targets)
-
-        result_box = QMessageBox(self)
-        result_box.setWindowTitle("已加入排程")
-        result_box.setText(f"已建立 {self.created_count} 筆待檢核排程。")
-        go_button = result_box.addButton("前往排程中心", QMessageBox.ButtonRole.AcceptRole)
-        result_box.addButton("繼續編輯", QMessageBox.ButtonRole.RejectRole)
-        result_box.exec()
-
-        self.go_to_schedule_center = result_box.clickedButton() == go_button
         self.accept()

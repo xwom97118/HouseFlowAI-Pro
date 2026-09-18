@@ -145,6 +145,7 @@ class MainWindow(QMainWindow):
             "dashboard": DashboardPage(
                 self.db,
                 self.navigate,
+                on_start_review=self._on_start_review,
             ),
             "sync_center": SyncCenterPage(
                 self.db,
@@ -159,6 +160,7 @@ class MainWindow(QMainWindow):
             "poster": PosterPage(
                 self.db,
                 self.navigate,
+                on_scheduled=self._on_poster_scheduled,
             ),
             "groups": GroupsPage(
                 self.db,
@@ -424,6 +426,19 @@ class MainWindow(QMainWindow):
         if hasattr(self, "engine"):
             self.engine.sync_from_settings()
             self._sync_automation_toggle_label()
+
+    def _on_start_review(self) -> None:
+        schedule_page = self.pages.get("schedule")
+        if schedule_page is not None and hasattr(schedule_page, "set_tab"):
+            schedule_page.set_tab(1)  # 「待檢核」
+        self.navigate("schedule")
+
+    def _on_poster_scheduled(self, batch_id: str, _count: int) -> None:
+        schedule_page = self.pages.get("schedule")
+        if schedule_page is not None and hasattr(schedule_page, "focus_batch"):
+            schedule_page.focus_batch(batch_id)
+        self.navigate("schedule")
+        self._on_dashboard_relevant_change()
 
     def _on_dashboard_relevant_change(self) -> None:
         properties_page = self.pages.get("properties")

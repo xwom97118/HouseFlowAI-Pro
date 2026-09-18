@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
+from typing import Callable
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication, QIcon, QPixmap
+from PySide6.QtGui import QGuiApplication, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QDialog,
     QFileDialog,
@@ -17,6 +20,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QVBoxLayout,
     QWidget,
@@ -26,25 +30,33 @@ from app.services import brand_profile
 from app.services.database import Database
 from app.services.facebook_service import FacebookService
 from app.services.copywriting_engine import AJCopyEngine
+from app.services.schedule_runner import AdHocPublishRunner
 from app.widgets.property_picker import PropertyPicker
-from app.widgets.common import ImagePreviewList, PropertySummaryCard, SectionTitle
-from app.widgets.schedule_dialog import AddToScheduleDialog
+from app.widgets.common import ImagePreviewList, PropertySummaryCard, SectionTitle, get_thumbnail_icon, show_toast
+from app.widgets.schedule_dialog import DeleteRuleSelector, ScheduleTimePicker
 
 COPY_STYLES = ["親切自然", "專業分析", "成交導向", "簡短直接", "短影音口吻"]
 
 
 class PosterPage(QWidget):
-    def __init__(self, db: Database, navigate) -> None:
+    def __init__(
+        self,
+        db: Database,
+        navigate,
+        on_scheduled: Callable[[str, int], None] | None = None,
+    ) -> None:
         super().__init__()
 
         self.db = db
         self.navigate = navigate
+        self.on_scheduled = on_scheduled
         self.facebook = FacebookService()
         self.copy_engine = AJCopyEngine()
         self.current_property_id: int | None = None
         self.image_paths: list[str] = []
         self.use_sync_images = True
         self.group_checks: list[tuple[QCheckBox, str]] = []
+        self.publish_runner: AdHocPublishRunner | None = None
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -242,9 +254,52 @@ class PosterPage(QWidget):
         utility_row.addStretch()
         root.addLayout(utility_row)
 
+        # STEP 5：發布方式 --------------------------------------------------
+        step5 = self._step_card("STEP 5", "發布方式")
+        step5_layout = step5.layout()
+
+        self.mode_group = QButtonGroup(self)
+        self.mode_immediate = QRadioButton("立即發布")
+        self.mode_schedule = QRadioButton("加入排程")
+        self.mode_schedule.setChecked(True)  # HouseFlow 主要工作流程是自動排程，預設選它
+        self.mode_group.addButton(self.mode_immediate)
+        self.mode_group.addButton(self.mode_schedule)
+        self.mode_immediate.toggled.connect(self._update_cta_mode)
+
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(self.mode_immediate)
+        mode_row.addWidget(self.mode_schedule)
+        mode_row.addStretch()
+        step5_layout.addLayout(mode_row)
+
+        self.immediate_panel = QFrame()
+        immediate_layout = QVBoxLayout(self.immediate_panel)
+        immediate_layout.setContentsMargins(0, 4, 0, 0)
+        immediate_hint = QLabel("確認後 HouseFlow 會自動操作 Facebook 完成發布，過程中請勿關閉瀏覽器視窗。")
+        immediate_hint.setObjectName("Muted")
+        immediate_hint.setWordWrap(True)
+        immediate_layout.addWidget(immediate_hint)
+        step5_layout.addWidget(self.immediate_panel)
+
+        self.schedule_panel = QFrame()
+        schedule_panel_layout = QVBoxLayout(self.schedule_panel)
+        schedule_panel_layout.setContentsMargins(0, 4, 0, 0)
+        schedule_panel_layout.setSpacing(10)
+
+        schedule_panel_layout.addWidget(QLabel("發布時間"))
+        self.time_picker = ScheduleTimePicker()
+        schedule_panel_layout.addWidget(self.time_picker)
+
+        schedule_panel_layout.addWidget(QLabel("自動刪除貼文"))
+        self.delete_rule = DeleteRuleSelector(db)
+        schedule_panel_layout.addWidget(self.delete_rule)
+
+        step5_layout.addWidget(self.schedule_panel)
+
+        root.addWidget(step5)
         root.addStretch()
 
-        # STEP 5：主要操作（固定在畫面底部，不隨內容捲動） -------------------
+        # 主要操作（固定在畫面底部，不隨內容捲動）：同一時間只有一個主要 CTA -----
         cta_bar = QFrame()
         cta_bar.setObjectName("CtaBar")
         cta_layout = QHBoxLayout(cta_bar)
@@ -262,21 +317,17 @@ class PosterPage(QWidget):
         preview_button.setObjectName("SecondaryButton")
         preview_button.clicked.connect(self.preview_post)
 
-        self.schedule_button = QPushButton("加入排程")
-        self.schedule_button.setObjectName("PrimaryButton")
-        self.schedule_button.clicked.connect(self.add_to_schedule)
-
-        self.publish_button = QPushButton("立即發布")
-        self.publish_button.setObjectName("SuccessButton")
-        self.publish_button.clicked.connect(self.start_publish)
+        self.primary_cta_button = QPushButton("加入排程")
+        self.primary_cta_button.setObjectName("PrimaryButton")
+        self.primary_cta_button.clicked.connect(self._on_primary_cta_clicked)
 
         cta_layout.addWidget(draft_button)
         cta_layout.addWidget(preview_button)
-        cta_layout.addWidget(self.schedule_button)
-        cta_layout.addWidget(self.publish_button)
+        cta_layout.addWidget(self.primary_cta_button)
 
         outer.addWidget(cta_bar)
 
+        self._update_cta_mode()
         self.reload_properties()
         self.reload_groups()
         self.refresh_image_preview()
@@ -351,18 +402,7 @@ class PosterPage(QWidget):
             return
 
         for index, image_path in enumerate(self.image_paths):
-            pixmap = QPixmap(image_path)
-
-            if pixmap.isNull():
-                icon = QIcon()
-            else:
-                scaled = pixmap.scaled(
-                    150,
-                    110,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                icon = QIcon(scaled)
+            icon = get_thumbnail_icon(image_path)
 
             prefix = "★ 封面" if index == 0 else f"{index + 1:02d}"
             item = QListWidgetItem(icon, f"{prefix}\n{Path(image_path).name}")
@@ -778,75 +818,111 @@ class PosterPage(QWidget):
                 }
             )
 
+        show_toast(self, f"✓ 已儲存 {len(targets)} 筆草稿", kind="success")
         self.status_label.setText(f"已儲存 {len(targets)} 筆草稿，可以到「排程管理」繼續編輯。")
-        QMessageBox.information(self, "已儲存草稿", f"已儲存 {len(targets)} 筆草稿。")
 
-    def add_to_schedule(self) -> None:
+    # ------------------------------------------------------------------
+    # STEP 5：發布方式（立即發布 / 加入排程，同一時間只有一個主要 CTA）
+    # ------------------------------------------------------------------
+
+    def _update_cta_mode(self, *_args) -> None:
+        immediate = self.mode_immediate.isChecked()
+        self.immediate_panel.setVisible(immediate)
+        self.schedule_panel.setVisible(not immediate)
+        self.primary_cta_button.setText("確認立即發布" if immediate else "加入排程")
+        self.primary_cta_button.setObjectName("SuccessButton" if immediate else "PrimaryButton")
+        style = self.primary_cta_button.style()
+        if style is not None:
+            style.unpolish(self.primary_cta_button)
+            style.polish(self.primary_cta_button)
+
+    def _on_primary_cta_clicked(self) -> None:
+        if self.mode_immediate.isChecked():
+            self._do_immediate_publish()
+        else:
+            self._do_add_to_schedule()
+
+    def _validate_common(self) -> tuple[str, list[tuple[str, str]]] | None:
         if self.current_property_id is None:
             QMessageBox.information(self, "尚未選擇物件", "請先選擇一筆物件。")
-            return
+            return None
 
         content = self.content_editor.toPlainText().strip()
         targets = self.get_target_pairs()
 
         if not content:
             QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
-            return
+            return None
 
         if not targets:
             QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
-            return
+            return None
 
         if not self._check_compliance_before_publish():
+            return None
+
+        return content, targets
+
+    def _do_add_to_schedule(self) -> None:
+        validated = self._validate_common()
+        if validated is None:
+            return
+        content, targets = validated
+
+        if not self.time_picker.is_valid():
+            QMessageBox.warning(self, "發布時間不正確", "發布時間不能早於目前時間。")
             return
 
-        property_data = self.db.get_property(self.current_property_id)
+        # 立即給回饋：按下去馬上看到「建立中…」，不用等整頁 refresh 才知道有沒有反應。
+        self.primary_cta_button.setEnabled(False)
+        self.primary_cta_button.setText("建立中…")
+        QApplication.processEvents()
 
-        dialog = AddToScheduleDialog(
-            db=self.db,
-            property_data=property_data,
-            copy_text=content,
-            image_paths=self.image_paths,
-            targets=targets,
-            parent=self,
-        )
-        dialog.exec()
+        scheduled_at = self.time_picker.value_str()
+        delete_after_days = self.delete_rule.value()
+        batch_id = uuid.uuid4().hex
 
-        if dialog.created_count:
-            self.status_label.setText(f"已加入排程：{dialog.created_count} 筆。")
-            if dialog.go_to_schedule_center:
-                self.navigate("schedule")
+        for target_url, target_label in targets:
+            self.db.create_schedule(
+                {
+                    "property_id": self.current_property_id,
+                    "platform": "facebook",
+                    "target": target_url,
+                    "target_label": target_label,
+                    "copy_text": content,
+                    "images": self.image_paths,
+                    "scheduled_at": scheduled_at,
+                    "status": "pending_review",
+                    "batch_id": batch_id,
+                    "delete_after_days": delete_after_days,
+                }
+            )
 
-    def start_publish(self) -> None:
-        content = self.content_editor.toPlainText().strip()
-        targets = self.get_targets()
+        created_count = len(targets)
+        self.primary_cta_button.setEnabled(True)
+        self._update_cta_mode()
 
-        if not content:
-            QMessageBox.warning(self, "沒有內容", "請先輸入貼文內容。")
+        show_toast(self, f"✓ 已加入排程：{created_count} 筆，等待核准", kind="success")
+        self.status_label.setText(f"已加入排程：{created_count} 筆，已導向排程中心。")
+
+        if callable(self.on_scheduled):
+            self.on_scheduled(batch_id, created_count)
+        else:
+            self.navigate("schedule")
+
+    def _do_immediate_publish(self) -> None:
+        if self.publish_runner is not None:
+            QMessageBox.information(self, "發布進行中", "目前已有發布正在進行，請稍候。")
             return
 
-        if not targets:
-            QMessageBox.warning(self, "沒有發布位置", "請勾選個人動態或至少一個社團。")
+        validated = self._validate_common()
+        if validated is None:
             return
+        content, target_pairs = validated
+        targets = [url for url, _label in target_pairs]
 
-        if not self._check_compliance_before_publish():
-            return
-
-        selected_group_names = [
-            checkbox.text() for checkbox, _ in self.group_checks if checkbox.isChecked()
-        ]
-
-        target_lines: list[str] = []
-
-        if self.publish_profile.isChecked():
-            target_lines.append("• Facebook 個人動態")
-
-        target_lines.extend(f"• {name}" for name in selected_group_names)
-
-        preview_content = content
-
-        if len(preview_content) > 800:
-            preview_content = preview_content[:800] + "\n……"
+        target_lines = [f"• {label}" for _url, label in target_pairs]
+        preview_content = content if len(content) <= 800 else content[:800] + "\n……"
 
         confirmation = QMessageBox(self)
         confirmation.setIcon(QMessageBox.Icon.Warning)
@@ -871,57 +947,69 @@ class PosterPage(QWidget):
 
         QGuiApplication.clipboard().setText(content)
 
-        self.publish_button.setEnabled(False)
+        self._selected_group_names_snapshot = [
+            checkbox.text() for checkbox, _ in self.group_checks if checkbox.isChecked()
+        ]
+        self._publish_profile_snapshot = self.publish_profile.isChecked()
+
+        # 真正的 Facebook 自動化（Playwright）放到背景 QThread 執行，
+        # 不能卡住 GUI——這裡只是換了執行緒，publish_posts() 本身完全沒有改。
+        self.primary_cta_button.setEnabled(False)
+        self.primary_cta_button.setText("發布中…")
         self.login_button.setEnabled(False)
-        self.status_label.setText(
-            f"正在自動發布 0/{len(targets)}，請勿關閉 HouseFlow 或 Chromium……"
-        )
-        QApplication.processEvents()
+        self.status_label.setText(f"正在自動發布，共 {len(targets)} 個位置，請勿關閉 HouseFlow 或 Chromium……")
 
-        try:
-            report = self.facebook.publish_posts(targets, content, self.image_paths)
+        self.publish_runner = AdHocPublishRunner(targets, content, self.image_paths)
+        self.publish_runner.finished.connect(self._on_publish_finished)
+        self.publish_runner.failed.connect(self._on_publish_failed)
+        self.publish_runner.start()
 
-            success_count = int(report.get("success_count", 0))
-            failed_count = int(report.get("failed_count", 0))
-            results = list(report.get("results", []))
+    def _on_publish_finished(self, report: dict) -> None:
+        success_count = int(report.get("success_count", 0))
+        failed_count = int(report.get("failed_count", 0))
+        results = list(report.get("results", []))
+        selected_group_names = getattr(self, "_selected_group_names_snapshot", [])
+        publish_profile_checked = getattr(self, "_publish_profile_snapshot", False)
 
-            result_lines: list[str] = []
+        result_lines: list[str] = []
+        for index, result in enumerate(results, start=1):
+            success = bool(result.get("success"))
+            url = str(result.get("url", ""))
+            message = str(result.get("message", ""))
+            icon = "✓" if success else "✕"
 
-            for index, result in enumerate(results, start=1):
-                success = bool(result.get("success"))
-                url = str(result.get("url", ""))
-                message = str(result.get("message", ""))
-
-                icon = "✓" if success else "✕"
-
-                if url == "https://www.facebook.com/":
-                    target_name = "Facebook 個人動態"
-                else:
-                    offset = 2 if self.publish_profile.isChecked() else 1
-                    position = index - offset
-                    target_name = (
-                        selected_group_names[position]
-                        if 0 <= position < len(selected_group_names)
-                        else url
-                    )
-
-                result_lines.append(
-                    f"{icon} {target_name}" + ("" if success else f"\n   原因：{message}")
+            if url == "https://www.facebook.com/":
+                target_name = "Facebook 個人動態"
+            else:
+                offset = 2 if publish_profile_checked else 1
+                position = index - offset
+                target_name = (
+                    selected_group_names[position]
+                    if 0 <= position < len(selected_group_names)
+                    else url
                 )
 
-            self.status_label.setText(f"發布完成：成功 {success_count}，失敗 {failed_count}。")
+            result_lines.append(f"{icon} {target_name}" + ("" if success else f"\n   原因：{message}"))
 
-            summary = f"成功：{success_count}\n失敗：{failed_count}\n\n" + "\n".join(result_lines)
+        self.status_label.setText(f"發布完成：成功 {success_count}，失敗 {failed_count}。")
+        summary = f"成功：{success_count}\n失敗：{failed_count}\n\n" + "\n".join(result_lines)
 
-            if failed_count:
-                QMessageBox.warning(self, "立即發布完成", summary)
-            else:
-                QMessageBox.information(self, "立即發布完成", summary)
+        if failed_count:
+            QMessageBox.warning(self, "立即發布完成", summary)
+        else:
+            show_toast(self, "✓ 發布完成", kind="success")
 
-        except Exception as exc:
-            QMessageBox.critical(self, "立即發布失敗", str(exc))
-            self.status_label.setText("Facebook 立即發布失敗。")
+        self._finish_publish_ui()
 
-        finally:
-            self.publish_button.setEnabled(True)
-            self.login_button.setEnabled(True)
+    def _on_publish_failed(self, message: str) -> None:
+        QMessageBox.critical(self, "立即發布失敗", message)
+        self.status_label.setText("Facebook 立即發布失敗。")
+        self._finish_publish_ui()
+
+    def _finish_publish_ui(self) -> None:
+        if self.publish_runner is not None:
+            self.publish_runner.wait_and_cleanup()
+        self.publish_runner = None
+        self.login_button.setEnabled(True)
+        self.primary_cta_button.setEnabled(True)
+        self._update_cta_mode()
