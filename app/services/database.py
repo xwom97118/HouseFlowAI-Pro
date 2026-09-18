@@ -7,6 +7,15 @@ from typing import Any
 from app.services import app_paths
 
 
+class DuplicateSyncSourceError(Exception):
+    """新增同步來源時，網址正規化後跟現有來源相同。"""
+
+    def __init__(self, existing_id: int, existing_name: str) -> None:
+        self.existing_id = existing_id
+        self.existing_name = existing_name
+        super().__init__(f"同步來源已存在：{existing_name}")
+
+
 class Database:
     def __init__(self, path: Path | None = None) -> None:
         path = path if path is not None else app_paths.db_path()
@@ -179,8 +188,22 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 ON schedules(property_id);
                 """
             )
+            self._ensure_sync_source_columns(conn)
             self.set_default_setting(conn, "ai_enabled", "0")
             self._seed_default_brand_profile(conn)
+
+    def _ensure_sync_source_columns(self, conn: sqlite3.Connection) -> None:
+        """3.5 自動同步會用到的欄位，先用 backward-compatible migration
+        加進來；這一輪不會真的啟動 timer，只是預留欄位。
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(sync_sources)")}
+        additions = {
+            "sync_interval_minutes": "INTEGER NOT NULL DEFAULT 60",
+            "next_sync_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE sync_sources ADD COLUMN {column} {definition}")
 
     def _seed_default_brand_profile(self, conn: sqlite3.Connection) -> None:
         """第一次啟動時的品牌／經紀業資訊種子值。只有在該 key 完全沒有
@@ -604,6 +627,32 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             ).fetchone()
         return dict(row) if row else None
 
+    @staticmethod
+    def normalize_sync_source_url(url: str) -> str:
+        """把網址正規化成方便比對重複的形式：scheme/host 轉小寫、去掉
+        結尾斜線、去掉 fragment。刻意不動 query string 與 path 大小寫，
+        避免把實際不同的來源誤判成同一個。
+        """
+        from urllib.parse import urlparse, urlunparse
+
+        parsed = urlparse(url.strip())
+        path = parsed.path.rstrip("/")
+        return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), path, "", parsed.query, ""))
+
+    def find_sync_source_by_url(self, url: str) -> dict[str, Any] | None:
+        with self.connect() as conn:
+            return self._find_sync_source_by_url(conn, url)
+
+    def _find_sync_source_by_url(
+        self, conn: sqlite3.Connection, url: str
+    ) -> dict[str, Any] | None:
+        normalized = self.normalize_sync_source_url(url)
+        rows = conn.execute("SELECT * FROM sync_sources").fetchall()
+        for row in rows:
+            if self.normalize_sync_source_url(str(row["url"])) == normalized:
+                return dict(row)
+        return None
+
     def save_sync_source(
         self, data: dict[str, Any], source_id: int | None = None
     ) -> int:
@@ -618,6 +667,12 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
 
         with self.connect() as conn:
             if source_id is None:
+                duplicate = self._find_sync_source_by_url(conn, url)
+                if duplicate is not None:
+                    raise DuplicateSyncSourceError(
+                        existing_id=int(duplicate["id"]),
+                        existing_name=str(duplicate["name"]),
+                    )
                 cur = conn.execute(
                     """
                     INSERT INTO sync_sources(name, source_type, url, enabled, auto_sync_enabled)

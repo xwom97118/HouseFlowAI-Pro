@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.services.database import Database
+from app.services.database import Database, DuplicateSyncSourceError
 from app.services.sync_runner import SyncRunner
 from app.widgets.common import MetricCard, SectionTitle
 from app.widgets.universal_import_dialog import UniversalImportDialog
@@ -326,9 +326,24 @@ class SyncCenterPage(QWidget):
 
     def add_source(self) -> None:
         dialog = SyncSourceDialog(parent=self)
-        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_data:
+        if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result_data:
+            return
+
+        try:
             self.db.save_sync_source(dialog.result_data)
-            self.refresh()
+        except DuplicateSyncSourceError as exc:
+            confirm = QMessageBox.question(
+                self,
+                "此同步來源已存在",
+                f"這個網址已經有一個來源「{exc.existing_name}」了。\n\n"
+                "要用剛剛輸入的名稱／設定更新它嗎？",
+            )
+            if confirm == QMessageBox.StandardButton.Yes:
+                self.db.save_sync_source(dialog.result_data, source_id=exc.existing_id)
+            else:
+                return
+
+        self.refresh()
 
     def edit_source(self) -> None:
         source = self.selected_source()
