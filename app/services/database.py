@@ -1,10 +1,34 @@
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.services import app_paths
+
+# 排程相關時間欄位（scheduled_at、next_retry_at、delete_at、
+# delete_next_retry_at、published_at、started_at、deleted_at）統一用
+# 「本機時間」字串（跟 QDateTimeEdit 選出來的時間同一個基準），不要
+# 混用 SQLite 的 CURRENT_TIMESTAMP（那是 UTC）。這裡提供一個共用格式
+# 化函式，確保全部一致，避免比較時區跑掉。
+LOCAL_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def now_local_str() -> str:
+    return datetime.now().strftime(LOCAL_TIME_FORMAT)
+
+
+def local_str_plus(base: str | None, **delta_kwargs: float) -> str:
+    """base 是本機時間字串（空字串代表現在），回傳 base + timedelta。"""
+    if base:
+        try:
+            start = datetime.strptime(base, LOCAL_TIME_FORMAT)
+        except ValueError:
+            start = datetime.now()
+    else:
+        start = datetime.now()
+    return (start + timedelta(**delta_kwargs)).strftime(LOCAL_TIME_FORMAT)
 
 
 class DuplicateSyncSourceError(Exception):
@@ -186,11 +210,66 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
 
                 CREATE INDEX IF NOT EXISTS idx_schedules_property
                 ON schedules(property_id);
+
+                CREATE TABLE IF NOT EXISTS schedule_executions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    schedule_id INTEGER NOT NULL,
+                    execution_type TEXT NOT NULL,
+                    attempt_number INTEGER NOT NULL DEFAULT 1,
+                    execution_token TEXT NOT NULL DEFAULT '',
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL DEFAULT 'running',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY(schedule_id) REFERENCES schedules(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_schedule_executions_schedule
+                ON schedule_executions(schedule_id);
                 """
             )
             self._ensure_sync_source_columns(conn)
+            self._ensure_schedule_columns(conn)
             self.set_default_setting(conn, "ai_enabled", "0")
             self._seed_default_brand_profile(conn)
+            self._seed_default_automation_settings(conn)
+
+    def _ensure_schedule_columns(self, conn: sqlite3.Connection) -> None:
+        """3.3 Automation Engine 用到的欄位：atomic claim token、批次
+        分組（同一次「加入排程」建立的多個 target 共用 batch_id，UI
+        用來顯示「3/4 發布成功」）、發布重試排程、自動刪文規則與狀態。
+        backward-compatible ALTER TABLE，不影響既有 schedules 資料。
+        """
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(schedules)")}
+        additions = {
+            "batch_id": "TEXT NOT NULL DEFAULT ''",
+            "execution_token": "TEXT NOT NULL DEFAULT ''",
+            "started_at": "TEXT NOT NULL DEFAULT ''",
+            "next_retry_at": "TEXT NOT NULL DEFAULT ''",
+            "delete_after_days": "INTEGER",
+            "delete_at": "TEXT NOT NULL DEFAULT ''",
+            "delete_status": "TEXT NOT NULL DEFAULT 'not_scheduled'",
+            "delete_attempt_count": "INTEGER NOT NULL DEFAULT 0",
+            "delete_next_retry_at": "TEXT NOT NULL DEFAULT ''",
+            "deleted_at": "TEXT NOT NULL DEFAULT ''",
+        }
+        for column, definition in additions.items():
+            if column not in existing:
+                conn.execute(f"ALTER TABLE schedules ADD COLUMN {column} {definition}")
+
+    def _seed_default_automation_settings(self, conn: sqlite3.Connection) -> None:
+        defaults = {
+            "automation_enabled": "1",
+            "automation_check_interval_seconds": "30",
+            "automation_max_publish_retries": "3",
+            "automation_delete_enabled": "1",
+            "automation_default_delete_days": "15",
+            "automation_max_delete_retries": "3",
+            "minimize_to_tray": "1",
+            "timezone": "Asia/Taipei",
+        }
+        for key, value in defaults.items():
+            self.set_default_setting(conn, key, value)
 
     def _ensure_sync_source_columns(self, conn: sqlite3.Connection) -> None:
         """3.5 自動同步會用到的欄位，先用 backward-compatible migration
@@ -979,14 +1058,15 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
     def create_schedule(self, data: dict[str, Any]) -> int:
         images_value = data.get("images", [])
         images = images_value if isinstance(images_value, str) else "\n".join(images_value)
+        delete_after_days = data.get("delete_after_days")
 
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO schedules(
                     property_id, platform, target, target_label, copy_text,
-                    images, scheduled_at, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    images, scheduled_at, status, batch_id, delete_after_days
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data.get("property_id"),
@@ -997,6 +1077,8 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                     images,
                     str(data.get("scheduled_at", "")).strip(),
                     str(data.get("status", "pending_review")).strip() or "pending_review",
+                    str(data.get("batch_id", "")).strip(),
+                    int(delete_after_days) if delete_after_days not in (None, "") else None,
                 ),
             )
             return int(cur.lastrowid)
@@ -1133,27 +1215,355 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
     def mark_schedule_published(
         self, schedule_id: int, post_url: str = "", post_id: str = ""
     ) -> None:
+        """標記發布成功。published_at 用本機時間（跟 scheduled_at 同一個
+        基準），並且用這筆排程自己保存的 delete_after_days 規則，從
+        「這次真正發布成功的時間」（不是原本排程時間）算出 delete_at ——
+        手動「立即發布」跟 Automation Engine 自動發布都會呼叫這裡，
+        自動刪文排程只需要在這一個地方算，兩條路徑都會拿到。
+        """
+        published_at = now_local_str()
         with self.connect() as conn:
+            row = conn.execute(
+                "SELECT delete_after_days FROM schedules WHERE id=?", (schedule_id,)
+            ).fetchone()
+            delete_after_days = row["delete_after_days"] if row else None
+
+            delete_at = ""
+            delete_status = "not_scheduled"
+            if delete_after_days is not None:
+                delete_at = local_str_plus(published_at, days=int(delete_after_days))
+                delete_status = "pending"
+
             conn.execute(
                 """
-                UPDATE schedules SET status='published', published_at=CURRENT_TIMESTAMP,
-                    post_url=?, post_id=?, error_message='', updated_at=CURRENT_TIMESTAMP
+                UPDATE schedules SET status='published', published_at=?,
+                    post_url=?, post_id=?, error_message='', execution_token='',
+                    delete_at=?, delete_status=?, updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
-                (post_url, post_id, schedule_id),
+                (published_at, post_url, post_id, delete_at, delete_status, schedule_id),
             )
 
     def mark_schedule_failed(self, schedule_id: int, error_message: str) -> None:
+        """終端失敗（不會再自動重試，需要人工「重新執行」）。"""
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE schedules
                 SET status='failed', error_message=?, retry_count=retry_count+1,
-                    updated_at=CURRENT_TIMESTAMP
+                    execution_token='', updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
                 (error_message, schedule_id),
             )
+
+    # ---------------------------------------------------------------
+    # Automation Engine：atomic claim / retry / recovery（發布）
+    # ---------------------------------------------------------------
+
+    def list_due_publish_schedules(self, limit: int = 20) -> list[dict[str, Any]]:
+        now = now_local_str()
+        sql = """
+            SELECT * FROM schedules
+            WHERE status='scheduled'
+              AND scheduled_at <= ?
+              AND (next_retry_at = '' OR next_retry_at <= ?)
+            ORDER BY scheduled_at ASC
+            LIMIT ?
+        """
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, (now, now, limit)).fetchall()]
+
+    def claim_schedule_for_publish(self, schedule_id: int, execution_token: str) -> bool:
+        """Atomic claim：只有真的把 status 從 scheduled 改成 publishing 的
+        那一次呼叫，affected rowcount 才會是 1。任何併發呼叫（timer tick
+        跟手動「立即檢查排程」同時觸發、engine 重複啟動…）都只有一個
+        會搶到，這是防止重複發文的核心機制，不是靠 in-process 的鎖。
+        """
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE schedules SET status='publishing', started_at=?,
+                    execution_token=?, updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND status='scheduled'
+                """,
+                (now_local_str(), execution_token, schedule_id),
+            )
+            return cur.rowcount == 1
+
+    def schedule_publish_retry(
+        self, schedule_id: int, delay_kwargs: dict[str, float], error_message: str
+    ) -> None:
+        """發布失敗但明確可以重試：retry_count+1，回到 scheduled 狀態，
+        設定 next_retry_at 讓 engine 之後才會再撿起來，不用 sleep()。
+        """
+        next_retry_at = local_str_plus(None, **delay_kwargs)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules
+                SET status='scheduled', retry_count=retry_count+1,
+                    next_retry_at=?, error_message=?, execution_token='',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (next_retry_at, error_message, schedule_id),
+            )
+
+    def mark_schedule_needs_review(self, schedule_id: int, error_message: str) -> None:
+        """結果不確定（例如送出後 timeout），不能自動重試以免重複發文。
+        需要使用者確認「有沒有真的發出去」後才能繼續。
+        """
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules SET status='needs_review', error_message=?,
+                    execution_token='', updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (error_message, schedule_id),
+            )
+
+    def resolve_needs_review(self, schedule_id: int, resolution: str) -> None:
+        """使用者確認後的處理：
+        resolution='already_published' -> 直接標記已發布（不重發）
+        resolution='retry'             -> 回到 scheduled，讓 engine 重新嘗試
+        resolution='cancel'            -> 取消這筆排程
+        """
+        with self.connect() as conn:
+            if resolution == "already_published":
+                conn.execute(
+                    """
+                    UPDATE schedules SET status='published', published_at=?,
+                        error_message='', updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (now_local_str(), schedule_id),
+                )
+            elif resolution == "retry":
+                conn.execute(
+                    """
+                    UPDATE schedules SET status='scheduled', next_retry_at='',
+                        error_message='', updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (schedule_id,),
+                )
+            elif resolution == "cancel":
+                conn.execute(
+                    "UPDATE schedules SET status='cancelled', updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (schedule_id,),
+                )
+
+    def list_stale_publishing(self, stale_minutes: int = 10) -> list[dict[str, Any]]:
+        """Crash recovery 用：APP 啟動時找「卡在 publishing 太久」的排程。
+        無法確認 Facebook 是否真的發布成功，一律標記 needs_review，
+        絕對不會自動重發。
+        """
+        threshold = local_str_plus(None, minutes=-stale_minutes)
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedules WHERE status='publishing' AND started_at <= ? AND started_at != ''",
+                (threshold,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------------------------------------------------------------
+    # Automation Engine：自動刪文
+    # ---------------------------------------------------------------
+
+    def list_due_delete_schedules(self, limit: int = 20) -> list[dict[str, Any]]:
+        now = now_local_str()
+        sql = """
+            SELECT * FROM schedules
+            WHERE delete_status='pending'
+              AND delete_at != '' AND delete_at <= ?
+              AND (delete_next_retry_at = '' OR delete_next_retry_at <= ?)
+            ORDER BY delete_at ASC
+            LIMIT ?
+        """
+        with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, (now, now, limit)).fetchall()]
+
+    def claim_schedule_for_delete(self, schedule_id: int, execution_token: str) -> bool:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE schedules SET delete_status='deleting', execution_token=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND delete_status='pending'
+                """,
+                (execution_token, schedule_id),
+            )
+            return cur.rowcount == 1
+
+    def mark_schedule_deleted(self, schedule_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules SET delete_status='deleted', deleted_at=?,
+                    execution_token='', updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (now_local_str(), schedule_id),
+            )
+
+    def schedule_delete_retry(
+        self, schedule_id: int, delay_kwargs: dict[str, float], error_message: str
+    ) -> None:
+        next_retry_at = local_str_plus(None, **delay_kwargs)
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules
+                SET delete_status='pending', delete_attempt_count=delete_attempt_count+1,
+                    delete_next_retry_at=?, error_message=?, execution_token='',
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (next_retry_at, error_message, schedule_id),
+            )
+
+    def mark_delete_failed_terminal(self, schedule_id: int, error_message: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules
+                SET delete_status='delete_failed', delete_attempt_count=delete_attempt_count+1,
+                    error_message=?, execution_token='', updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (error_message, schedule_id),
+            )
+
+    def mark_delete_manual_required(self, schedule_id: int, reason: str = "") -> None:
+        """沒有可靠的 remote_post_id/post_url，絕對不能猜、不能自動刪。"""
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules SET delete_status='manual_required', error_message=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (reason, schedule_id),
+            )
+
+    def cancel_auto_delete(self, schedule_id: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedules SET delete_status='cancelled', delete_at='',
+                    delete_after_days=NULL, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (schedule_id,),
+            )
+
+    def update_delete_rule(self, schedule_id: int, delete_after_days: int | None) -> None:
+        """修改刪除時間（例如 15 天 -> 30 天）。只允許在還沒真的執行
+        刪除以前調整；delete_at 依目前的 published_at 重新計算。
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT published_at FROM schedules WHERE id=?", (schedule_id,)
+            ).fetchone()
+            published_at = row["published_at"] if row else ""
+
+            if delete_after_days is None:
+                conn.execute(
+                    """
+                    UPDATE schedules SET delete_after_days=NULL, delete_at='',
+                        delete_status='not_scheduled', updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (schedule_id,),
+                )
+                return
+
+            delete_at = local_str_plus(published_at, days=int(delete_after_days)) if published_at else ""
+            delete_status = "pending" if published_at else "not_scheduled"
+            conn.execute(
+                """
+                UPDATE schedules SET delete_after_days=?, delete_at=?, delete_status=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (delete_after_days, delete_at, delete_status, schedule_id),
+            )
+
+    # ---------------------------------------------------------------
+    # Automation Engine：execution 記錄（audit trail）
+    # ---------------------------------------------------------------
+
+    def create_execution(
+        self, schedule_id: int, execution_type: str, attempt_number: int, execution_token: str
+    ) -> int:
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO schedule_executions(
+                    schedule_id, execution_type, attempt_number, execution_token, started_at, status
+                ) VALUES (?, ?, ?, ?, ?, 'running')
+                """,
+                (schedule_id, execution_type, attempt_number, execution_token, now_local_str()),
+            )
+            return int(cur.lastrowid)
+
+    def finish_execution(self, execution_id: int, status: str, error_message: str = "") -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE schedule_executions SET status=?, error_message=?, finished_at=?
+                WHERE id=?
+                """,
+                (status, error_message, now_local_str(), execution_id),
+            )
+
+    def list_executions(self, schedule_id: int) -> list[dict[str, Any]]:
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedule_executions WHERE schedule_id=? ORDER BY id",
+                (schedule_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    # ---------------------------------------------------------------
+    # Automation Engine：批次（同一次「加入排程」建立的多個 target）
+    # ---------------------------------------------------------------
+
+    def list_batch_schedules(self, batch_id: str) -> list[dict[str, Any]]:
+        if not batch_id:
+            return []
+        with self.connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM schedules WHERE batch_id=? ORDER BY id", (batch_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def today_automation_summary(self) -> dict[str, int]:
+        with self.connect() as conn:
+            def _count(where: str) -> int:
+                return int(
+                    conn.execute(f"SELECT COUNT(*) FROM schedules WHERE {where}").fetchone()[0]
+                )
+
+            today = "date('now', 'localtime')"
+            return {
+                "pending_review_today": _count(
+                    f"status='pending_review' AND date(created_at, 'localtime') = {today}"
+                ),
+                "scheduled_today": _count(f"status='scheduled' AND date(scheduled_at) = {today}"),
+                "published_today": _count(
+                    f"status='published' AND date(published_at) = {today}"
+                ),
+                "failed_today": _count(
+                    f"status IN ('failed','needs_review') AND date(updated_at, 'localtime') = {today}"
+                ),
+                "delete_pending_today": _count(
+                    f"delete_status='pending' AND date(delete_at) = {today}"
+                ),
+                "deleted_today": _count(f"delete_status='deleted' AND date(deleted_at) = {today}"),
+            }
 
     def schedule_dashboard_counts(self) -> dict[str, int]:
         with self.connect() as conn:

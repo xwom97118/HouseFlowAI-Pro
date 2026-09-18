@@ -254,6 +254,72 @@ class FacebookService:
             "results": results,
         }
 
+    def delete_post(self, remote_post_url: str) -> dict[str, Any]:
+        """刪除一篇 HouseFlow 自己發布、且已經有可靠 remote_post_url 的
+        貼文。呼叫端（AutomationEngine）必須先確認這個 URL 存在且可靠
+        才能呼叫這裡 —— 這個方法本身不做任何「用文案/物件名稱/時間找
+        貼文」之類的猜測性比對，只會直接開啟這個貼文自己的網址操作。
+
+        目前沒有任何發布流程會回傳可靠的 remote_post_url（見
+        publish_posts() 的說明），所以這個方法目前實際上不會被正式
+        呼叫到；先建好架構與安全介面，selector 是參考現有
+        _click_publish 等方法推測的合理操作流程，還沒有機會對真正的
+        Facebook 介面驗證過，正式使用前需要真人在允許的範圍內測試。
+
+        回傳：{"success": bool, "message": str}
+        """
+        if not remote_post_url:
+            raise ValueError("缺少 remote_post_url，不能刪除貼文。")
+
+        with sync_playwright() as playwright:
+            context = self._open_context(playwright)
+            page = self._get_page(context)
+
+            try:
+                page.goto(
+                    remote_post_url,
+                    wait_until="domcontentloaded",
+                    timeout=60_000,
+                )
+                page.wait_for_timeout(2000)
+
+                self._raise_if_blocked(page)
+
+                menu_button = page.get_by_role(
+                    "button",
+                    name=re.compile(r"動態消息選項|貼文選項|更多選項|More|Actions for this post"),
+                )
+                if not self._click_first_visible(menu_button):
+                    raise RuntimeError("找不到貼文選項按鈕，無法刪除。")
+                page.wait_for_timeout(800)
+
+                delete_action = page.get_by_role(
+                    "menuitem",
+                    name=re.compile(r"刪除貼文|移到垃圾桶|Delete post|Move to trash"),
+                )
+                if not self._click_first_visible(delete_action):
+                    raise RuntimeError("找不到刪除選項，無法刪除。")
+                page.wait_for_timeout(800)
+
+                confirm_button = page.get_by_role(
+                    "button",
+                    name=re.compile(r"^刪除$|移到垃圾桶|^Delete$|Move to trash"),
+                )
+                if not self._click_first_visible(confirm_button):
+                    raise RuntimeError("找不到刪除確認按鈕，無法刪除。")
+                page.wait_for_timeout(1500)
+
+                return {"success": True, "message": "已刪除"}
+
+            except Exception as exc:
+                return {"success": False, "message": str(exc)}
+
+            finally:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+
     def _verify_prepared_post(
         self,
         page: Page,
