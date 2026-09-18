@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QDateTime, QTime, Qt
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QDateTimeEdit,
     QDialog,
@@ -15,7 +17,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QRadioButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -24,6 +28,75 @@ from app.services.copywriting_engine import AJCopyEngine
 from app.services.database import Database
 from app.widgets.common import ImagePreviewList, PropertySummaryCard
 from app.widgets.property_picker import PropertyPicker
+
+
+class DeleteRuleSelector(QWidget):
+    """「自動刪除貼文」選項：不刪 / 1,3,7,15,30 天 / 自訂。兩個排程
+    建立對話框（NewScheduleDialog、AddToScheduleDialog）共用同一份，
+    避免各自兜一份不同的刪文規則 UI。
+    """
+
+    PRESET_DAYS = (1, 3, 7, 15, 30)
+    _UNSET = object()
+
+    def __init__(self, db: Database, preset_days: int | None = _UNSET) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.group = QButtonGroup(self)
+        self.radios: list[tuple[QRadioButton, int | None]] = []
+
+        if preset_days is self._UNSET:
+            try:
+                default_days = int(db.get_setting("automation_default_delete_days", "15") or 15)
+            except ValueError:
+                default_days = 15
+        else:
+            default_days = preset_days
+
+        none_row = QHBoxLayout()
+        none_radio = QRadioButton("不自動刪除")
+        self.group.addButton(none_radio)
+        self.radios.append((none_radio, None))
+        none_row.addWidget(none_radio)
+        none_row.addStretch()
+        layout.addLayout(none_row)
+
+        preset_row = QHBoxLayout()
+        for days in self.PRESET_DAYS:
+            radio = QRadioButton(f"發布後 {days} 天")
+            self.group.addButton(radio)
+            self.radios.append((radio, days))
+            preset_row.addWidget(radio)
+        layout.addLayout(preset_row)
+
+        custom_row = QHBoxLayout()
+        self.custom_radio = QRadioButton("自訂")
+        self.group.addButton(self.custom_radio)
+        self.custom_days = QSpinBox()
+        self.custom_days.setRange(1, 365)
+        self.custom_days.setSuffix(" 天")
+        self.custom_days.setValue(default_days if default_days is not None else 15)
+        custom_row.addWidget(self.custom_radio)
+        custom_row.addWidget(self.custom_days)
+        custom_row.addStretch()
+        layout.addLayout(custom_row)
+
+        matched = next((radio for radio, days in self.radios if days == default_days), None)
+        if matched is not None:
+            matched.setChecked(True)
+        else:
+            self.custom_radio.setChecked(True)
+
+    def value(self) -> int | None:
+        for radio, days in self.radios:
+            if radio.isChecked():
+                return days
+        if self.custom_radio.isChecked():
+            return self.custom_days.value()
+        return None
 
 
 class NewScheduleDialog(QDialog):
@@ -108,6 +181,10 @@ class NewScheduleDialog(QDialog):
         schedule_row.addWidget(self.scheduled_at_edit)
         schedule_row.addStretch()
         root.addLayout(schedule_row)
+
+        root.addWidget(QLabel("自動刪除貼文"))
+        self.delete_rule = DeleteRuleSelector(db)
+        root.addWidget(self.delete_rule)
 
         button_row = QHBoxLayout()
         cancel_button = QPushButton("取消")
@@ -273,6 +350,8 @@ class NewScheduleDialog(QDialog):
             return
 
         scheduled_at = self.scheduled_at_edit.dateTime().toString("yyyy-MM-dd HH:mm:00")
+        delete_after_days = self.delete_rule.value()
+        batch_id = uuid.uuid4().hex
 
         for target_url, target_label in targets:
             self.db.create_schedule(
@@ -285,6 +364,8 @@ class NewScheduleDialog(QDialog):
                     "images": self.image_paths,
                     "scheduled_at": scheduled_at,
                     "status": "pending_review",
+                    "batch_id": batch_id,
+                    "delete_after_days": delete_after_days,
                 }
             )
 
@@ -374,6 +455,10 @@ class AddToScheduleDialog(QDialog):
         time_row.addStretch()
         root.addLayout(time_row)
 
+        root.addWidget(QLabel("自動刪除貼文"))
+        self.delete_rule = DeleteRuleSelector(db)
+        root.addWidget(self.delete_rule)
+
         root.addStretch()
 
         button_row = QHBoxLayout()
@@ -406,6 +491,8 @@ class AddToScheduleDialog(QDialog):
     def _create_schedules(self) -> None:
         scheduled_at = self.scheduled_at_edit.dateTime().toString("yyyy-MM-dd HH:mm:00")
         property_id = (self.property_data or {}).get("id")
+        delete_after_days = self.delete_rule.value()
+        batch_id = uuid.uuid4().hex
 
         for target_url, target_label in self.targets:
             self.db.create_schedule(
@@ -418,6 +505,8 @@ class AddToScheduleDialog(QDialog):
                     "images": self.image_paths,
                     "scheduled_at": scheduled_at,
                     "status": "pending_review",
+                    "batch_id": batch_id,
+                    "delete_after_days": delete_after_days,
                 }
             )
 

@@ -77,3 +77,61 @@ class SchedulePublishRunner(QObject):
         except Exception as exc:
             self.db.mark_schedule_failed(schedule_id, str(exc))
             self.failed.emit(str(exc))
+
+
+class ScheduleDeleteRunner(QObject):
+    """在背景 QThread 手動刪除單一排程已發布的貼文。呼叫端必須先確認
+    這筆排程有可靠的 post_url 才能呼叫這裡——這裡本身不做任何猜測。
+    """
+
+    finished = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, db: Database, schedule: dict) -> None:
+        super().__init__()
+        self.db = db
+        self.schedule = schedule
+        self._qthread: QThread | None = None
+
+    def start(self) -> None:
+        self._qthread = QThread()
+        self.moveToThread(self._qthread)
+        self._qthread.started.connect(self._run)
+        self.finished.connect(self._qthread.quit)
+        self.failed.connect(self._qthread.quit)
+        self._qthread.start()
+
+    def wait_and_cleanup(self, timeout_ms: int = 5000) -> None:
+        if self._qthread is None:
+            return
+        self._qthread.wait(timeout_ms)
+        app = QCoreApplication.instance()
+        if app is not None:
+            self.moveToThread(app.thread())
+        self.deleteLater()
+        self._qthread.deleteLater()
+
+    def _run(self) -> None:
+        schedule_id = int(self.schedule["id"])
+        post_url = str(self.schedule.get("post_url", "")).strip()
+
+        if not post_url:
+            self.db.mark_delete_manual_required(schedule_id, "沒有可靠的 remote_post_url。")
+            self.failed.emit("這筆排程沒有可靠的貼文網址，無法刪除。")
+            return
+
+        try:
+            facebook = FacebookService()
+            result = facebook.delete_post(post_url)
+
+            if result.get("success"):
+                self.db.mark_schedule_deleted(schedule_id)
+                self.finished.emit({"schedule_id": schedule_id, "success": True, "message": "已刪除"})
+            else:
+                message = str(result.get("message", "")) or "刪除失敗（未知原因）"
+                self.db.mark_delete_failed_terminal(schedule_id, message)
+                self.finished.emit({"schedule_id": schedule_id, "success": False, "message": message})
+
+        except Exception as exc:
+            self.db.mark_delete_failed_terminal(schedule_id, str(exc))
+            self.failed.emit(str(exc))

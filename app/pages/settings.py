@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -12,6 +14,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -31,10 +34,11 @@ def _scrollable(inner: QWidget) -> QScrollArea:
 
 
 class SettingsPage(QWidget):
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, on_saved: Callable[[], None] | None = None) -> None:
         super().__init__()
 
         self.db = db
+        self.on_saved = on_saved
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 24)
@@ -55,9 +59,7 @@ class SettingsPage(QWidget):
         tabs.addTab(self._build_placeholder_tab(
             "同步來源、自動同步排程與同步頻率設定，請至左側「同步中心」管理。"
         ), "同步設定")
-        tabs.addTab(self._build_placeholder_tab(
-            "排程狀態、核准與發布紀錄，請至左側「排程管理」管理。"
-        ), "排程設定")
+        tabs.addTab(self._build_automation_tab(), "排程設定")
         root.addWidget(tabs, 1)
 
         button_row = QHBoxLayout()
@@ -288,6 +290,86 @@ class SettingsPage(QWidget):
         return _scrollable(content)
 
     # ------------------------------------------------------------------
+    # 排程設定（Automation Engine）
+    # ------------------------------------------------------------------
+
+    def _build_automation_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 12, 12, 0)
+        layout.setSpacing(16)
+
+        publish_group = QGroupBox("自動排程發布")
+        publish_form = QFormLayout(publish_group)
+
+        self.automation_enabled = QCheckBox("啟用自動排程發布")
+        self.automation_enabled.setChecked(
+            self.db.get_setting("automation_enabled", "1") == "1"
+        )
+        publish_form.addRow("", self.automation_enabled)
+
+        self.minimize_to_tray = QCheckBox("關閉視窗時最小化到系統匣")
+        self.minimize_to_tray.setChecked(
+            self.db.get_setting("minimize_to_tray", "1") == "1"
+        )
+        publish_form.addRow("", self.minimize_to_tray)
+
+        self.check_interval = QSpinBox()
+        self.check_interval.setRange(5, 3600)
+        self.check_interval.setSuffix(" 秒")
+        self.check_interval.setValue(
+            int(self.db.get_setting("automation_check_interval_seconds", "30") or 30)
+        )
+        publish_form.addRow("自動檢查間隔", self.check_interval)
+
+        self.max_publish_retries = QSpinBox()
+        self.max_publish_retries.setRange(0, 10)
+        self.max_publish_retries.setValue(
+            int(self.db.get_setting("automation_max_publish_retries", "3") or 3)
+        )
+        publish_form.addRow("發布失敗最大重試次數", self.max_publish_retries)
+
+        layout.addWidget(publish_group)
+
+        delete_group = QGroupBox("自動刪除已發布貼文")
+        delete_form = QFormLayout(delete_group)
+
+        self.automation_delete_enabled = QCheckBox("啟用自動刪文")
+        self.automation_delete_enabled.setChecked(
+            self.db.get_setting("automation_delete_enabled", "1") == "1"
+        )
+        delete_form.addRow("", self.automation_delete_enabled)
+
+        self.default_delete_days = QSpinBox()
+        self.default_delete_days.setRange(1, 365)
+        self.default_delete_days.setSuffix(" 天")
+        self.default_delete_days.setValue(
+            int(self.db.get_setting("automation_default_delete_days", "15") or 15)
+        )
+        delete_form.addRow("預設自動刪文", self.default_delete_days)
+
+        self.max_delete_retries = QSpinBox()
+        self.max_delete_retries.setRange(0, 10)
+        self.max_delete_retries.setValue(
+            int(self.db.get_setting("automation_max_delete_retries", "3") or 3)
+        )
+        delete_form.addRow("刪文失敗最大重試次數", self.max_delete_retries)
+
+        delete_note = QLabel(
+            "目前發布流程還沒有辦法可靠取得 Facebook 貼文的網址／ID，\n"
+            "所以自動刪文功能已經完整建好，但實際上會顯示「需要人工處理」，\n"
+            "要等之後的版本補上可靠的貼文識別方式才能真的自動執行。"
+        )
+        delete_note.setObjectName("MutedLabel")
+        delete_note.setWordWrap(True)
+        delete_form.addRow("", delete_note)
+
+        layout.addWidget(delete_group)
+        layout.addStretch()
+
+        return _scrollable(content)
+
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_placeholder_tab(message: str) -> QWidget:
@@ -328,10 +410,20 @@ class SettingsPage(QWidget):
             "copy_style": self.copy_style.currentText(),
             "openai_api_key": self.api_key.text().strip(),
             "ai_enabled": "1" if self.ai_enabled.isChecked() else "0",
+            "automation_enabled": "1" if self.automation_enabled.isChecked() else "0",
+            "minimize_to_tray": "1" if self.minimize_to_tray.isChecked() else "0",
+            "automation_check_interval_seconds": str(self.check_interval.value()),
+            "automation_max_publish_retries": str(self.max_publish_retries.value()),
+            "automation_delete_enabled": "1" if self.automation_delete_enabled.isChecked() else "0",
+            "automation_default_delete_days": str(self.default_delete_days.value()),
+            "automation_max_delete_retries": str(self.max_delete_retries.value()),
         }
 
         for key, value in settings.items():
             self.db.set_setting(key, value)
+
+        if callable(self.on_saved):
+            self.on_saved()
 
         QMessageBox.information(self, "儲存完成", "設定已儲存。")
 

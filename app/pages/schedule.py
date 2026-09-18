@@ -20,9 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.database import Database
-from app.services.schedule_runner import SchedulePublishRunner
+from app.services.schedule_runner import ScheduleDeleteRunner, SchedulePublishRunner
 from app.widgets.common import MetricCard, SectionTitle
-from app.widgets.schedule_dialog import NewScheduleDialog
+from app.widgets.schedule_dialog import DeleteRuleSelector, NewScheduleDialog
 
 STATUS_LABELS = {
     "draft": "草稿",
@@ -31,8 +31,19 @@ STATUS_LABELS = {
     "publishing": "發布中",
     "published": "發布成功",
     "failed": "發布失敗",
+    "needs_review": "需要人工確認",
     "cancelled": "已取消",
     "deleted": "已刪除",
+}
+
+DELETE_STATUS_LABELS = {
+    "not_scheduled": "不自動刪除",
+    "pending": "待刪除",
+    "deleting": "刪除中",
+    "deleted": "已刪除",
+    "delete_failed": "刪除失敗",
+    "manual_required": "需人工刪除",
+    "cancelled": "已取消刪除",
 }
 
 FILTERS: list[tuple[str, list[str] | None, bool]] = [
@@ -40,6 +51,7 @@ FILTERS: list[tuple[str, list[str] | None, bool]] = [
     ("今日待檢核", ["pending_review"], True),
     ("今日已排程", ["scheduled"], True),
     ("發布中", ["publishing"], False),
+    ("需要確認", ["needs_review"], False),
     ("今日發布成功", ["published"], True),
     ("今日發布失敗", ["failed"], True),
     ("全部歷史", None, False),
@@ -59,6 +71,7 @@ class ScheduleCenterPage(QWidget):
         self.on_published = on_published
         self.rows: list[dict] = []
         self.runner: SchedulePublishRunner | None = None
+        self.delete_runner: ScheduleDeleteRunner | None = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 24)
@@ -77,16 +90,18 @@ class ScheduleCenterPage(QWidget):
 
         cards_row = QHBoxLayout()
         self.card_pending = MetricCard("今日待檢核", "0")
-        self.card_scheduled = MetricCard("今日已排程", "0")
-        self.card_publishing = MetricCard("發布中", "0")
-        self.card_published = MetricCard("今日發布成功", "0")
-        self.card_failed = MetricCard("今日發布失敗", "0")
+        self.card_scheduled = MetricCard("今日待發布", "0")
+        self.card_published = MetricCard("今日已發布", "0")
+        self.card_failed = MetricCard("今日失敗", "0")
+        self.card_delete_pending = MetricCard("今日待刪除", "0")
+        self.card_deleted = MetricCard("今日已刪除", "0")
         for card in (
             self.card_pending,
             self.card_scheduled,
-            self.card_publishing,
             self.card_published,
             self.card_failed,
+            self.card_delete_pending,
+            self.card_deleted,
         ):
             cards_row.addWidget(card, 1)
         root.addLayout(cards_row)
@@ -134,6 +149,22 @@ class ScheduleCenterPage(QWidget):
         delete_btn.setObjectName("SecondaryButton")
         delete_btn.clicked.connect(self.delete_selected)
 
+        resolve_btn = QPushButton("處理需要確認")
+        resolve_btn.setObjectName("SecondaryButton")
+        resolve_btn.clicked.connect(self.resolve_needs_review_selected)
+
+        self.delete_post_btn = QPushButton("立即刪除此貼文")
+        self.delete_post_btn.setObjectName("SecondaryButton")
+        self.delete_post_btn.clicked.connect(self.delete_post_selected)
+
+        modify_delete_btn = QPushButton("修改刪除時間")
+        modify_delete_btn.setObjectName("SecondaryButton")
+        modify_delete_btn.clicked.connect(self.modify_delete_rule_selected)
+
+        cancel_delete_btn = QPushButton("取消自動刪除")
+        cancel_delete_btn.setObjectName("SecondaryButton")
+        cancel_delete_btn.clicked.connect(self.cancel_auto_delete_selected)
+
         toolbar.addWidget(add_btn)
         toolbar.addWidget(QLabel("篩選："))
         toolbar.addWidget(self.filter_combo)
@@ -143,18 +174,38 @@ class ScheduleCenterPage(QWidget):
         toolbar.addWidget(approve_all_btn)
         toolbar.addWidget(reject_btn)
         toolbar.addWidget(self.publish_btn)
+        toolbar.addWidget(resolve_btn)
         toolbar.addWidget(cancel_btn)
         toolbar.addWidget(delete_btn)
         toolbar.addStretch()
         root.addLayout(toolbar)
 
+        delete_toolbar = QHBoxLayout()
+        delete_toolbar.addWidget(QLabel("貼文刪除操作："))
+        delete_toolbar.addWidget(self.delete_post_btn)
+        delete_toolbar.addWidget(modify_delete_btn)
+        delete_toolbar.addWidget(cancel_delete_btn)
+        delete_toolbar.addStretch()
+        root.addLayout(delete_toolbar)
+
         self.status_label = QLabel("準備完成")
         self.status_label.setObjectName("MutedLabel")
         root.addWidget(self.status_label)
 
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels(
-            ["物件", "發布位置", "預定時間", "狀態", "核准時間", "發布時間", "失敗原因／備註", "重試次數"]
+            [
+                "物件",
+                "發布位置",
+                "預定時間",
+                "狀態",
+                "核准時間",
+                "發布時間",
+                "失敗原因／備註",
+                "重試次數",
+                "刪除狀態",
+                "刪除時間",
+            ]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -175,12 +226,13 @@ class ScheduleCenterPage(QWidget):
         self._refresh_table()
 
     def _refresh_summary(self) -> None:
-        counts = self.db.schedule_dashboard_counts()
+        counts = self.db.today_automation_summary()
         self.card_pending.set_value(counts.get("pending_review_today", 0))
         self.card_scheduled.set_value(counts.get("scheduled_today", 0))
-        self.card_publishing.set_value(counts.get("publishing", 0))
         self.card_published.set_value(counts.get("published_today", 0))
         self.card_failed.set_value(counts.get("failed_today", 0))
+        self.card_delete_pending.set_value(counts.get("delete_pending_today", 0))
+        self.card_deleted.set_value(counts.get("deleted_today", 0))
 
     def _current_filter(self) -> tuple[list[str] | None, bool]:
         index = self.filter_combo.currentIndex()
@@ -207,10 +259,12 @@ class ScheduleCenterPage(QWidget):
                 row.get("published_at", ""),
                 row.get("error_message", ""),
                 row.get("retry_count", 0),
+                DELETE_STATUS_LABELS.get(row.get("delete_status", ""), row.get("delete_status", "")),
+                row.get("delete_at", ""),
             ]
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value or ""))
-                if column_index in (2, 3, 4, 5, 7):
+                if column_index in (2, 3, 4, 5, 7, 8, 9):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 self.table.setItem(row_index, column_index, item)
             if row.get("id") == selected_id:
@@ -253,9 +307,23 @@ class ScheduleCenterPage(QWidget):
             f"預定時間：{row.get('scheduled_at', '')}\n"
             f"狀態：{STATUS_LABELS.get(row.get('status', ''), row.get('status', ''))}\n"
             f"圖片：{len([p for p in str(row.get('images', '')).split(chr(10)) if p.strip()])} 張\n"
+            f"刪除規則：{DELETE_STATUS_LABELS.get(row.get('delete_status', ''), row.get('delete_status', ''))}"
+            f"（{row.get('delete_at', '') or '未設定'}）\n"
         )
         if row.get("error_message"):
             info += f"失敗原因：{row.get('error_message')}\n"
+
+        batch_id = str(row.get("batch_id") or "")
+        if batch_id:
+            batch_rows = self.db.list_batch_schedules(batch_id)
+            if len(batch_rows) > 1:
+                success = sum(1 for r in batch_rows if r.get("status") == "published")
+                info += f"\n同批發布位置：{success}/{len(batch_rows)} 成功\n"
+                for r in batch_rows:
+                    icon = {"published": "✅", "failed": "❌", "needs_review": "⚠"}.get(
+                        r.get("status", ""), "⏳"
+                    )
+                    info += f"  {icon} {r.get('target_label', '')}：{STATUS_LABELS.get(r.get('status', ''), r.get('status', ''))}\n"
 
         info_label = QLabel(info)
         layout.addWidget(info_label)
@@ -361,6 +429,162 @@ class ScheduleCenterPage(QWidget):
             return
         self.db.delete_schedule(int(row["id"]))
         self.refresh()
+
+    # ------------------------------------------------------------------
+    # 需要人工確認（發布結果不確定）
+
+    def resolve_needs_review_selected(self) -> None:
+        row = self.selected()
+        if not row:
+            QMessageBox.information(self, "尚未選擇排程", "請先在列表中選擇一筆排程。")
+            return
+        if row.get("status") != "needs_review":
+            QMessageBox.warning(self, "無法處理", "只有「需要人工確認」狀態的排程需要這個操作。")
+            return
+
+        target_label = row.get("target_label", "")
+        reason = row.get("error_message", "")
+        box = QMessageBox(self)
+        box.setWindowTitle("需要人工確認")
+        box.setText(
+            f"「{row.get('property_title', '')} - {target_label}」的發布結果無法自動確認"
+            f"（原因：{reason or '未知'}）。\n\n"
+            "請先到 Facebook 上實際確認這篇貼文是否已經發布，再選擇下面的處理方式："
+        )
+        already_btn = box.addButton("已經發布成功", QMessageBox.ButtonRole.YesRole)
+        retry_btn = box.addButton("尚未發布，重新嘗試", QMessageBox.ButtonRole.ActionRole)
+        cancel_btn = box.addButton("取消這筆排程", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton("先不處理", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is already_btn:
+            self.db.resolve_needs_review(int(row["id"]), "already_published")
+            self.status_label.setText("已標記為發布成功。")
+        elif clicked is retry_btn:
+            self.db.resolve_needs_review(int(row["id"]), "retry")
+            self.status_label.setText("已排回等待自動重新發布。")
+        elif clicked is cancel_btn:
+            self.db.resolve_needs_review(int(row["id"]), "cancel")
+            self.status_label.setText("已取消這筆排程。")
+        else:
+            return
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # 自動刪文相關手動操作
+
+    def delete_post_selected(self) -> None:
+        if self.delete_runner is not None:
+            QMessageBox.information(self, "刪除進行中", "目前已有貼文正在刪除，請稍候。")
+            return
+
+        row = self.selected()
+        if not row:
+            QMessageBox.information(self, "尚未選擇排程", "請先在列表中選擇一筆排程。")
+            return
+        if row.get("status") != "published":
+            QMessageBox.warning(self, "無法刪除貼文", "只有已發布成功的貼文可以刪除。")
+            return
+        post_url = str(row.get("post_url") or "").strip()
+        if not post_url:
+            QMessageBox.warning(
+                self,
+                "無法自動刪除",
+                "這筆貼文沒有可靠的貼文網址，HouseFlow 無法安全確認要刪哪一篇，"
+                "請自行到 Facebook 上手動刪除。",
+            )
+            return
+        if row.get("delete_status") == "deleting":
+            QMessageBox.information(self, "刪除進行中", "這筆貼文正在刪除中，請稍候。")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "確認刪除貼文",
+            "確定要刪除Facebook上這篇貼文嗎？此操作可能無法復原。",
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        schedule_id = int(row["id"])
+        self.delete_post_btn.setEnabled(False)
+        self.status_label.setText(f"正在刪除貼文：{row.get('property_title', '')} - {row.get('target_label', '')} ……")
+
+        self.delete_runner = ScheduleDeleteRunner(self.db, row)
+        self.delete_runner.finished.connect(self._on_delete_finished)
+        self.delete_runner.failed.connect(self._on_delete_failed)
+        self.delete_runner.start()
+
+    def _on_delete_finished(self, payload: dict) -> None:
+        success = bool(payload.get("success"))
+        message = str(payload.get("message", ""))
+        self.status_label.setText(("刪除成功：" if success else "刪除失敗：") + message)
+        self._finish_delete_ui()
+
+    def _on_delete_failed(self, message: str) -> None:
+        self.status_label.setText(f"刪除發生錯誤：{message}")
+        self._finish_delete_ui()
+
+    def _finish_delete_ui(self) -> None:
+        if self.delete_runner is not None:
+            self.delete_runner.wait_and_cleanup()
+        self.delete_runner = None
+        self.delete_post_btn.setEnabled(True)
+        self.refresh()
+
+    def modify_delete_rule_selected(self) -> None:
+        row = self.selected()
+        if not row:
+            QMessageBox.information(self, "尚未選擇排程", "請先在列表中選擇一筆排程。")
+            return
+        if row.get("status") != "published" or row.get("delete_status") not in ("pending", "manual_required"):
+            QMessageBox.warning(self, "無法修改", "只有已發布、尚未刪除的貼文可以修改自動刪除時間。")
+            return
+
+        current_days = row.get("delete_after_days")
+        current_days = int(current_days) if current_days not in (None, "") else None
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("修改刪除時間")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel(f"「{row.get('property_title', '')} - {row.get('target_label', '')}」的自動刪除時間："))
+        selector = DeleteRuleSelector(self.db, preset_days=current_days)
+        layout.addWidget(selector)
+
+        btn_row = QHBoxLayout()
+        ok_btn = QPushButton("儲存")
+        ok_btn.setObjectName("PrimaryButton")
+        ok_btn.clicked.connect(dialog.accept)
+        cancel_btn = QPushButton("取消")
+        cancel_btn.setObjectName("SecondaryButton")
+        cancel_btn.clicked.connect(dialog.reject)
+        btn_row.addStretch()
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(ok_btn)
+        layout.addLayout(btn_row)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        self.db.update_delete_rule(int(row["id"]), selector.value())
+        self.refresh()
+        self.status_label.setText("已更新自動刪除時間。")
+
+    def cancel_auto_delete_selected(self) -> None:
+        row = self.selected()
+        if not row:
+            QMessageBox.information(self, "尚未選擇排程", "請先在列表中選擇一筆排程。")
+            return
+        if row.get("delete_status") != "pending":
+            QMessageBox.warning(self, "無法取消", "只有「待刪除」狀態可以取消自動刪除。")
+            return
+        confirm = QMessageBox.question(self, "取消自動刪除", "確定要取消這篇貼文的自動刪除排程嗎？")
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        self.db.cancel_auto_delete(int(row["id"]))
+        self.refresh()
+        self.status_label.setText("已取消自動刪除。")
 
     # ------------------------------------------------------------------
 

@@ -1565,27 +1565,3 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 "deleted_today": _count(f"delete_status='deleted' AND date(deleted_at) = {today}"),
             }
 
-    def schedule_dashboard_counts(self) -> dict[str, int]:
-        with self.connect() as conn:
-            def _count(where: str) -> int:
-                return int(
-                    conn.execute(f"SELECT COUNT(*) FROM schedules WHERE {where}").fetchone()[0]
-                )
-
-            return {
-                "pending_review_today": _count(
-                    "status='pending_review' AND date(scheduled_at) = date('now', 'localtime')"
-                ),
-                "pending_review_total": _count("status='pending_review'"),
-                "scheduled_today": _count(
-                    "status='scheduled' AND date(scheduled_at) = date('now', 'localtime')"
-                ),
-                "publishing": _count("status='publishing'"),
-                "published_today": _count(
-                    "status='published' AND date(published_at, 'localtime') = date('now', 'localtime')"
-                ),
-                "failed_today": _count(
-                    "status='failed' AND date(updated_at, 'localtime') = date('now', 'localtime')"
-                ),
-                "failed_total": _count("status='failed'"),
-            }
