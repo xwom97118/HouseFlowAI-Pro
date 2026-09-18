@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -248,5 +249,26 @@ class AccountStatusCard(QFrame):
         status_row.addWidget(self.version_label)
         layout.addLayout(status_row)
 
+        self.automation_toggle_btn = QPushButton("暫停自動化")
+        self.automation_toggle_btn.setObjectName("SecondaryButton")
+        layout.addWidget(self.automation_toggle_btn)
+
     def set_name(self, name: str) -> None:
         self.name_label.setText(name or "尚未設定品牌名稱")
+
+    _STATUS_COLORS = {
+        "success": "#22C55E",
+        "neutral": "#94A3B8",
+        "danger": "#DC2626",
+        "info": "#2563EB",
+        "publishing": "#2563EB",
+        "warning": "#B45309",
+    }
+
+    def set_automation_status(self, text: str, kind: str = "neutral") -> None:
+        """由 AutomationEngine.status_changed 驅動，取代原本寫死的
+        「● Ready」，讓側邊欄反映真正的自動化狀態。
+        """
+        color = self._STATUS_COLORS.get(kind, self._STATUS_COLORS["neutral"])
+        self.status_label.setText(text)
+        self.status_label.setStyleSheet(f"color: {color}; font-size: 11px; font-weight: 700;")

@@ -16,6 +16,11 @@ def run() -> None:
     app.setOrganizationName("HouseFlow AI")
     app.setFont(QFont("Microsoft JhengHei UI", 10))
     app.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, True)
+    # 關閉視窗（X）預設只是最小化到系統匣，不是真的結束程式（見
+    # MainWindow.closeEvent）；沒有這行的話，Qt 在某些情況下會把「隱藏
+    # 最後一個可見視窗」誤判成「最後一個視窗關閉」而直接結束整個 app，
+    # 連背景執行中的 Automation Engine 都會被砍掉。
+    app.setQuitOnLastWindowClosed(False)
 
     try:
         import qdarktheme

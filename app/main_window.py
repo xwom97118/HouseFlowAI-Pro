@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QSize
+from PySide6.QtCore import QCoreApplication, QSize
+from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QStackedWidget,
+    QSystemTrayIcon,
     QVBoxLayout,
     QWidget,
 )
@@ -25,6 +28,7 @@ from app.pages.schedule import ScheduleCenterPage
 from app.pages.settings import SettingsPage
 from app.pages.strategy import StrategyPage
 from app.pages.sync_center import SyncCenterPage
+from app.services.automation_engine import AutomationEngine
 from app.services.database import Database
 from app.styles import APP_QSS
 from app.version import APP_NAME, APP_VERSION
@@ -36,6 +40,7 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle(f"{APP_NAME} {APP_VERSION}")
+        self.setWindowIcon(emoji_icon("🏠", 64))
         self.resize(1450, 880)
         self.setMinimumSize(1120, 720)
         self.setStyleSheet(APP_QSS)
@@ -171,7 +176,7 @@ class MainWindow(QMainWindow):
                 "成效分析",
                 "查看物件與Facebook發布紀錄。",
             ),
-            "settings": SettingsPage(self.db),
+            "settings": SettingsPage(self.db, on_saved=self._on_settings_saved),
         }
 
         for page in self.pages.values():
@@ -183,6 +188,139 @@ class MainWindow(QMainWindow):
             "dashboard",
             remember=False,
         )
+
+        self._quit_requested = False
+        self._tray_notice_shown = False
+
+        self.engine = AutomationEngine(self.db)
+        self.engine.status_changed.connect(self._on_automation_status_changed)
+        self.engine.notify.connect(self._on_automation_notify)
+        self.engine.cycle_finished.connect(self._on_automation_cycle_finished)
+        self.engine.login_required.connect(self._on_automation_login_required)
+        self.account_card.automation_toggle_btn.clicked.connect(self._toggle_automation)
+
+        self._build_tray_icon()
+        self.engine.start()
+        self.engine.trigger_now()  # 開機立即跑一次：復原卡住的排程、補上睡眠/關機期間錯過的到期工作
+        self._sync_automation_toggle_label()
+
+    # ------------------------------------------------------------------
+    # 系統匣 + Automation Engine
+    # ------------------------------------------------------------------
+
+    def _build_tray_icon(self) -> None:
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(self.windowIcon())
+        self.tray_icon.setToolTip(f"{APP_NAME} {APP_VERSION}")
+
+        menu = QMenu()
+        open_action = menu.addAction("開啟HouseFlow")
+        open_action.triggered.connect(self._show_from_tray)
+
+        self.tray_pause_action = menu.addAction("暫停自動化")
+        self.tray_pause_action.triggered.connect(self.engine.pause)
+        self.tray_resume_action = menu.addAction("繼續自動化")
+        self.tray_resume_action.triggered.connect(self.engine.resume)
+
+        check_now_action = menu.addAction("立即檢查排程")
+        check_now_action.triggered.connect(lambda: self.engine.trigger_now())
+
+        menu.addSeparator()
+        quit_action = menu.addAction("退出HouseFlow")
+        quit_action.triggered.connect(self._quit_from_tray)
+
+        self.tray_icon.setContextMenu(menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
+        self.tray_icon.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        self._quit_requested = True
+        self.close()
+
+    def _toggle_automation(self) -> None:
+        if self.engine.is_paused():
+            self.engine.resume()
+        else:
+            self.engine.pause()
+        self._sync_automation_toggle_label()
+
+    def _sync_automation_toggle_label(self) -> None:
+        paused = self.engine.is_paused()
+        self.account_card.automation_toggle_btn.setText("繼續自動化" if paused else "暫停自動化")
+        if hasattr(self, "tray_pause_action"):
+            self.tray_pause_action.setVisible(not paused)
+            self.tray_resume_action.setVisible(paused)
+
+    def _on_automation_status_changed(self, text: str, kind: str) -> None:
+        self.account_card.set_automation_status(text, kind)
+        self._sync_automation_toggle_label()
+
+    def _on_automation_notify(self, message: str) -> None:
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.showMessage(
+                APP_NAME, message, QSystemTrayIcon.MessageIcon.Information, 5000
+            )
+
+    def _on_automation_cycle_finished(self) -> None:
+        schedule_page = self.pages.get("schedule")
+        if schedule_page is not None and hasattr(schedule_page, "refresh"):
+            schedule_page.refresh()
+        self._on_dashboard_relevant_change()
+
+    def _on_automation_login_required(self) -> None:
+        # 視窗已經被最小化到系統匣時不跳出遮住畫面的對話框——tray 通知
+        # （engine.notify）跟側邊欄狀態已經足以提醒，使用者打開視窗時
+        # 才需要這個比較顯眼的提醒。
+        if not self.isVisible():
+            return
+        QMessageBox.warning(
+            self,
+            "Facebook 需要重新登入",
+            "自動排程發布／刪文暫停中，請到「發文中心」重新登入 Facebook，"
+            "登入完成後自動化會自動恢復。",
+        )
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        minimize_to_tray = self.db.get_setting("minimize_to_tray", "1") == "1"
+
+        if not self._quit_requested and minimize_to_tray and hasattr(self, "tray_icon"):
+            event.ignore()
+            self.hide()
+            if not self._tray_notice_shown:
+                self._tray_notice_shown = True
+                self.tray_icon.showMessage(
+                    APP_NAME,
+                    "HouseFlow 已在背景執行，自動排程仍會繼續。",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    5000,
+                )
+            return
+
+        if hasattr(self, "engine"):
+            self.engine.stop()
+        if hasattr(self, "tray_icon"):
+            self.tray_icon.hide()
+        event.accept()
+
+        # setQuitOnLastWindowClosed(False)（見 app/application.py）讓
+        # 「隱藏視窗最小化到系統匣」不會誤觸發整個 app 結束；真的要退出
+        # （這裡、或使用者按了 X 但設定沒開最小化到系統匣）時，
+        # 必須自己呼叫 quit() 讓事件迴圈真的結束。
+        app = QCoreApplication.instance()
+        if app is not None:
+            app.quit()
 
     def navigate(
         self,
@@ -281,6 +419,11 @@ class MainWindow(QMainWindow):
     def _refresh_sidebar_footer(self) -> None:
         display_name = self.db.get_setting("display_name", "").strip()
         self.account_card.set_name(display_name)
+
+    def _on_settings_saved(self) -> None:
+        if hasattr(self, "engine"):
+            self.engine.sync_from_settings()
+            self._sync_automation_toggle_label()
 
     def _on_dashboard_relevant_change(self) -> None:
         properties_page = self.pages.get("properties")

@@ -5,6 +5,7 @@ from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal
 
+from app.services.automation_logger import log_event
 from app.services.database import Database
 from app.services.facebook_service import FacebookService
 
@@ -117,6 +118,7 @@ class AutomationCycleWorker(QObject):
                 "無法確認 Facebook 是否已經真的發布成功，需要人工確認。",
             )
             summary["needs_review"] += 1
+            log_event("recovery", f"schedule_id={row['id']} 卡在 publishing，標記 needs_review")
 
     def _process_publishes(self, summary: dict[str, Any]) -> bool:
         """回傳 True 代表這次週期遇到登入/安全驗證問題，呼叫端應該跳過
@@ -130,6 +132,8 @@ class AutomationCycleWorker(QObject):
 
             if not self.db.claim_schedule_for_publish(schedule_id, token):
                 continue  # 被其他呼叫搶先 claim，跳過。
+
+            log_event("job_claimed", f"schedule_id={schedule_id} type=publish token={token[:8]}")
 
             attempt_number = int(row.get("retry_count", 0)) + 1
             execution_id = self.db.create_execution(
@@ -157,6 +161,7 @@ class AutomationCycleWorker(QObject):
                 self.db.mark_schedule_published(schedule_id, post_url="", post_id="")
                 self.db.finish_execution(execution_id, "success")
                 summary["published"] += 1
+                log_event("publish_success", f"schedule_id={schedule_id}")
                 continue
 
             message = str(result.get("message", "") or "未知錯誤")
@@ -168,12 +173,14 @@ class AutomationCycleWorker(QObject):
                 self.db.schedule_publish_retry(schedule_id, {"minutes": 0}, message)
                 self.db.finish_execution(execution_id, "needs_review", message)
                 summary["login_required"] = True
+                log_event("login_required", f"schedule_id={schedule_id}")
                 return True
 
             if classification == "needs_review":
                 self.db.mark_schedule_needs_review(schedule_id, message)
                 self.db.finish_execution(execution_id, "needs_review", message)
                 summary["needs_review"] += 1
+                log_event("publish_needs_review", f"schedule_id={schedule_id}")
                 continue
 
             # classification == "failed"：明確失敗，可以照規則重試。
@@ -181,12 +188,17 @@ class AutomationCycleWorker(QObject):
                 self.db.mark_schedule_failed(schedule_id, message)
                 self.db.finish_execution(execution_id, "failed", message)
                 summary["failed"] += 1
+                log_event("publish_failed", f"schedule_id={schedule_id} attempt={attempt_number}（終止重試）")
             else:
                 backoff_minutes = PUBLISH_RETRY_BACKOFF_MINUTES[
                     min(attempt_number - 1, len(PUBLISH_RETRY_BACKOFF_MINUTES) - 1)
                 ]
                 self.db.schedule_publish_retry(schedule_id, {"minutes": backoff_minutes}, message)
                 self.db.finish_execution(execution_id, "failed", message)
+                log_event(
+                    "publish_retry_scheduled",
+                    f"schedule_id={schedule_id} attempt={attempt_number} 等待 {backoff_minutes} 分鐘",
+                )
 
         return False
 
@@ -203,11 +215,14 @@ class AutomationCycleWorker(QObject):
                     schedule_id, "沒有可靠的 remote_post_url，無法自動刪除。"
                 )
                 summary["manual_delete_required"] += 1
+                log_event("delete_manual_required", f"schedule_id={schedule_id} 沒有可靠的 post_url")
                 continue
 
             token = uuid.uuid4().hex
             if not self.db.claim_schedule_for_delete(schedule_id, token):
                 continue
+
+            log_event("job_claimed", f"schedule_id={schedule_id} type=delete token={token[:8]}")
 
             attempt_number = int(row.get("delete_attempt_count", 0)) + 1
             execution_id = self.db.create_execution(
@@ -224,6 +239,7 @@ class AutomationCycleWorker(QObject):
                 self.db.mark_schedule_deleted(schedule_id)
                 self.db.finish_execution(execution_id, "success")
                 summary["deleted"] += 1
+                log_event("delete_success", f"schedule_id={schedule_id}")
                 continue
 
             message = str(result.get("message", "") or "未知錯誤")
@@ -233,18 +249,24 @@ class AutomationCycleWorker(QObject):
                 self.db.schedule_delete_retry(schedule_id, {"minutes": 0}, message)
                 self.db.finish_execution(execution_id, "needs_review", message)
                 summary["login_required"] = True
+                log_event("login_required", f"schedule_id={schedule_id} (delete)")
                 return
 
             if attempt_number >= self.max_delete_retries:
                 self.db.mark_delete_failed_terminal(schedule_id, message)
                 self.db.finish_execution(execution_id, "failed", message)
                 summary["delete_failed"] += 1
+                log_event("delete_failed", f"schedule_id={schedule_id} attempt={attempt_number}（終止重試）")
             else:
                 backoff_minutes = DELETE_RETRY_BACKOFF_MINUTES[
                     min(attempt_number - 1, len(DELETE_RETRY_BACKOFF_MINUTES) - 1)
                 ]
                 self.db.schedule_delete_retry(schedule_id, {"minutes": backoff_minutes}, message)
                 self.db.finish_execution(execution_id, "failed", message)
+                log_event(
+                    "delete_retry_scheduled",
+                    f"schedule_id={schedule_id} attempt={attempt_number} 等待 {backoff_minutes} 分鐘",
+                )
 
 
 class AutomationEngine(QObject):
@@ -287,6 +309,7 @@ class AutomationEngine(QObject):
         self._paused = not enabled
         self._timer.start()
         self._emit_status()
+        log_event("automation_started", f"paused={self._paused}")
 
     def stop(self) -> None:
         self._timer.stop()
@@ -294,23 +317,37 @@ class AutomationEngine(QObject):
             self._worker.wait_and_cleanup()
             self._worker = None
         self._started = False
+        log_event("automation_stopped")
 
     def pause(self) -> None:
         self._paused = True
         self.db.set_setting("automation_enabled", "0")
         self._emit_status()
+        log_event("automation_paused")
 
     def resume(self) -> None:
         self._paused = False
         self._login_blocked = False
         self.db.set_setting("automation_enabled", "1")
         self._emit_status()
+        log_event("automation_resumed")
 
     def is_paused(self) -> bool:
         return self._paused
 
     def reload_interval_from_settings(self) -> None:
         self._apply_interval_from_settings()
+
+    def sync_from_settings(self) -> None:
+        """設定頁儲存後呼叫：讓正在跑的 engine 立刻反映新的檢查間隔跟
+        啟用/停用開關，不用等使用者重開 app。設定本身已經被 Settings
+        頁存進 DB，這裡只是同步記憶體中的執行狀態。
+        """
+        self._apply_interval_from_settings()
+        enabled = self.db.get_setting("automation_enabled", "1") == "1"
+        if self._paused != (not enabled):
+            self._paused = not enabled
+            self._emit_status()
 
     def _apply_interval_from_settings(self) -> None:
         try:
