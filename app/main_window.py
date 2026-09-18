@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PySide6.QtCore import QSize
 from PySide6.QtWidgets import (
     QButtonGroup,
     QFrame,
@@ -27,6 +28,7 @@ from app.pages.sync_center import SyncCenterPage
 from app.services.database import Database
 from app.styles import APP_QSS
 from app.version import APP_NAME, APP_VERSION
+from app.widgets.common import AccountStatusCard, BrandHeader, emoji_icon
 
 
 class MainWindow(QMainWindow):
@@ -57,32 +59,35 @@ class MainWindow(QMainWindow):
         side_layout.setContentsMargins(12, 8, 12, 14)
         side_layout.setSpacing(6)
 
-        brand = QLabel(APP_NAME)
-        brand.setObjectName("Brand")
-        side_layout.addWidget(brand)
+        self.brand_header = BrandHeader("HouseFlow", "PROFESSIONAL")
+        side_layout.addWidget(self.brand_header)
+        side_layout.addSpacing(4)
 
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
 
         navs = [
-            ("dashboard", "🏠  Dashboard"),
-            ("sync_center", "🔄  同步中心"),
-            ("properties", "🏡  物件中心"),
-            ("poster", "📤  發文中心"),
-            ("groups", "📂  社團管理"),
-            ("ai", "🤖  AI 文案"),
-            ("crm", "👥  CRM"),
-            ("strategy", "🤝  成交策略"),
-            ("schedule", "📅  排程管理"),
-            ("analytics", "📈  分析"),
-            ("settings", "⚙  設定"),
+            ("dashboard", "🏠", "Dashboard"),
+            ("sync_center", "🔄", "同步中心"),
+            ("properties", "🏡", "物件中心"),
+            ("poster", "📤", "發文中心"),
+            ("groups", "📂", "社團管理"),
+            ("ai", "🤖", "AI 文案"),
+            ("crm", "👥", "CRM"),
+            ("strategy", "🤝", "成交策略"),
+            ("schedule", "📅", "排程管理"),
+            ("analytics", "📈", "分析"),
+            ("settings", "⚙", "設定"),
         ]
 
         self.nav_buttons: dict[str, QPushButton] = {}
+        nav_icon_size = QSize(20, 20)
 
-        for key, text in navs:
-            button = QPushButton(text)
+        for key, icon, label in navs:
+            button = QPushButton(label)
             button.setObjectName("NavButton")
+            button.setIcon(emoji_icon(icon, 22))
+            button.setIconSize(nav_icon_size)
             button.setCheckable(True)
             button.clicked.connect(
                 lambda _=False, current_key=key:
@@ -95,29 +100,8 @@ class MainWindow(QMainWindow):
 
         side_layout.addStretch()
 
-        footer = QFrame()
-        footer.setObjectName("SidebarFooter")
-        footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(12, 10, 12, 4)
-        footer_layout.setSpacing(2)
-
-        self.sidebar_user_label = QLabel("")
-        self.sidebar_user_label.setObjectName("SidebarUser")
-
-        version_row = QHBoxLayout()
-        version_row.setSpacing(6)
-        version_label = QLabel(f"{APP_NAME}\nv{APP_VERSION}")
-        version_label.setObjectName("SidebarVersion")
-        status_label = QLabel("● Ready")
-        status_label.setObjectName("SidebarStatus")
-        version_row.addWidget(version_label)
-        version_row.addStretch()
-        version_row.addWidget(status_label)
-
-        footer_layout.addWidget(self.sidebar_user_label)
-        footer_layout.addLayout(version_row)
-
-        side_layout.addWidget(footer)
+        self.account_card = AccountStatusCard(meta=APP_NAME, version=f"v{APP_VERSION}")
+        side_layout.addWidget(self.account_card)
 
         outer.addWidget(sidebar)
 
@@ -296,7 +280,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_sidebar_footer(self) -> None:
         display_name = self.db.get_setting("display_name", "").strip()
-        self.sidebar_user_label.setText(display_name or "尚未設定品牌名稱")
+        self.account_card.set_name(display_name)
 
     def _on_dashboard_relevant_change(self) -> None:
         properties_page = self.pages.get("properties")

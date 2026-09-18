@@ -4,10 +4,16 @@ APP_QSS = """
     font-size: 14px;
 }
 
-QMainWindow,
-QWidget {
+QMainWindow {
     background: #F6F8FC;
+}
+
+QWidget {
     color: #172033;
+}
+
+QLabel {
+    background: transparent;
 }
 
 #Sidebar {
@@ -15,16 +21,9 @@ QWidget {
     border: none;
 }
 
-#Brand {
-    color: #FFFFFF;
-    font-size: 22px;
-    font-weight: 800;
-    padding: 20px 16px 18px 16px;
-}
-
 #NavButton {
     background: transparent;
-    color: #AEBBD0;
+    color: #CBD5E1;
     text-align: left;
     padding: 13px 16px;
     border: 0;
@@ -71,7 +70,7 @@ QWidget {
 #DashboardHero {
     background: #FFFFFF;
     border: 1px solid #E6EBF2;
-    border-radius: 18px;
+    border-radius: 16px;
 }
 
 #DashboardGreeting {
@@ -464,23 +463,49 @@ QToolTip {
     color: #172033;
 }
 
-#SidebarFooter {
-    border-top: 1px solid #1F2A44;
+#BrandCard {
+    background: #1E293B;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
 }
 
-#SidebarUser {
+#BrandTitle {
+    color: #FFFFFF;
+    font-size: 17px;
+    font-weight: 800;
+}
+
+#BrandSubtitle {
+    color: #7C8AA5;
+    font-size: 10px;
+    font-weight: 700;
+    /* Qt QSS 不支援 letter-spacing，改用空白字元近似拉開字距。 */
+}
+
+#AccountCard {
+    background: #1E293B;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+}
+
+#AccountName {
     color: #FFFFFF;
     font-size: 14px;
     font-weight: 700;
 }
 
-#SidebarVersion {
-    color: #7C8AA5;
+#AccountMeta {
+    color: #94A3B8;
     font-size: 11px;
 }
 
-#SidebarStatus {
-    color: #34D399;
+#AccountVersion {
+    color: #64748B;
+    font-size: 11px;
+}
+
+#StatusReady {
+    color: #22C55E;
     font-size: 11px;
     font-weight: 700;
 }

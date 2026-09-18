@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QSize, Qt
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -14,6 +14,25 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+def emoji_icon(emoji: str, size: int = 22) -> QIcon:
+    """把一個 emoji 畫成固定大小的 QIcon，讓 Sidebar 選單圖示不論字符
+    本身寬窄都有一致的視覺大小與左側對齊。之後要換成 SVG icon 時，
+    只需要換掉這個函式內部的畫法，呼叫端（button.setIcon(...)）不用改。
+    """
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    font = painter.font()
+    font.setPointSize(int(size * 0.6))
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, emoji)
+    painter.end()
+
+    return QIcon(pixmap)
 
 
 class ImagePreviewList(QListWidget):
@@ -169,3 +188,65 @@ class PropertySummaryCard(QFrame):
 
         self.thumb_label.setPixmap(QPixmap())
         self.thumb_label.setText("無縮圖")
+
+
+class BrandHeader(QFrame):
+    """Sidebar 頂部品牌卡。之後要換上正式 Logo 時，只需要改這裡（例如
+    在 title 前面加一個 QLabel(QPixmap(...))），呼叫端完全不用動。
+    """
+
+    def __init__(self, name: str = "HouseFlow", subtitle: str = "PROFESSIONAL") -> None:
+        super().__init__()
+        self.setObjectName("BrandCard")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 12, 14, 12)
+        layout.setSpacing(2)
+
+        self.title_label = QLabel(name)
+        self.title_label.setObjectName("BrandTitle")
+
+        self.subtitle_label = QLabel(" ".join(subtitle))
+        self.subtitle_label.setObjectName("BrandSubtitle")
+
+        layout.addWidget(self.title_label)
+        layout.addWidget(self.subtitle_label)
+
+
+class AccountStatusCard(QFrame):
+    """Sidebar 底部帳號／版本／狀態卡。set_name() 讓 MainWindow 可以在
+    品牌名稱變更（例如使用者在設定頁改了顯示名稱）後更新顯示。
+    """
+
+    def __init__(self, meta: str = "", version: str = "") -> None:
+        super().__init__()
+        self.setObjectName("AccountCard")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(4)
+
+        self.name_label = QLabel("")
+        self.name_label.setObjectName("AccountName")
+        layout.addWidget(self.name_label)
+
+        self.meta_label = QLabel(meta)
+        self.meta_label.setObjectName("AccountMeta")
+        layout.addWidget(self.meta_label)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(6)
+
+        self.status_label = QLabel("● Ready")
+        self.status_label.setObjectName("StatusReady")
+
+        self.version_label = QLabel(version)
+        self.version_label.setObjectName("AccountVersion")
+
+        status_row.addWidget(self.status_label)
+        status_row.addStretch()
+        status_row.addWidget(self.version_label)
+        layout.addLayout(status_row)
+
+    def set_name(self, name: str) -> None:
+        self.name_label.setText(name or "尚未設定品牌名稱")
