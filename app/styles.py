@@ -43,6 +43,25 @@ QLabel {
     font-weight: 700;
 }
 
+#TabButton {
+    background: #EEF2F9;
+    color: #526176;
+    border: 0;
+    border-radius: 8px;
+    padding: 7px 16px;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+#TabButton:hover {
+    background: #E2E8F5;
+}
+
+#TabButton:checked {
+    background: #2563EB;
+    color: #FFFFFF;
+}
+
 #Topbar {
     background: #FFFFFF;
     border-bottom: 1px solid #E7ECF3;
@@ -57,6 +76,12 @@ QLabel {
 #Muted,
 #MutedLabel {
     color: #718096;
+}
+
+#WarningText {
+    color: #B91C1C;
+    font-weight: 600;
+    font-size: 12px;
 }
 
 #Card,
@@ -522,4 +547,18 @@ QToolTip {
 #StatusBadge[kind="danger"]  { background: #FEE2E2; color: #B91C1C; }
 #StatusBadge[kind="info"]    { background: #DBEAFE; color: #1D4ED8; }
 #StatusBadge[kind="neutral"] { background: #E5E9F0; color: #526176; }
+
+#Toast {
+    border-radius: 10px;
+    padding: 2px;
+}
+#Toast[kind="success"] { background: #16A34A; }
+#Toast[kind="danger"]  { background: #DC2626; }
+#Toast[kind="info"]    { background: #2563EB; }
+#ToastLabel {
+    color: #FFFFFF;
+    font-size: 13px;
+    font-weight: 600;
+    background: transparent;
+}
 """

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Callable
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFrame,
@@ -84,11 +86,13 @@ class DashboardPage(QWidget):
         self,
         db: Database,
         navigate,
+        on_start_review: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
 
         self.db = db
         self.navigate = navigate
+        self.on_start_review = on_start_review
 
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 28)
@@ -141,6 +145,33 @@ class DashboardPage(QWidget):
         hero_layout.addWidget(self.sync_button)
 
         root.addWidget(hero)
+
+        today_card = QFrame()
+        today_card.setObjectName("DashboardPanel")
+        today_layout = QHBoxLayout(today_card)
+        today_layout.setContentsMargins(22, 18, 22, 18)
+        today_layout.setSpacing(18)
+
+        today_text = QVBoxLayout()
+        today_text.setSpacing(4)
+        today_title = QLabel("📤 今日發文")
+        today_title.setObjectName("PanelTitle")
+        self.today_summary_label = QLabel("今天共 0 篇")
+        self.today_summary_label.setObjectName("PanelSubtitle")
+        self.today_detail_label = QLabel("待檢核 0　待發布 0　已發布 0　失敗 0")
+        self.today_detail_label.setObjectName("Muted")
+        today_text.addWidget(today_title)
+        today_text.addWidget(self.today_summary_label)
+        today_text.addWidget(self.today_detail_label)
+
+        today_layout.addLayout(today_text, 1)
+
+        self.start_review_button = QPushButton("開始今日檢核")
+        self.start_review_button.setObjectName("PrimaryButton")
+        self.start_review_button.clicked.connect(self._start_review)
+        today_layout.addWidget(self.start_review_button)
+
+        root.addWidget(today_card)
 
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(14)
@@ -388,8 +419,25 @@ class DashboardPage(QWidget):
 
         self.tasks_container.addWidget(row)
 
+    def _start_review(self) -> None:
+        if callable(self.on_start_review):
+            self.on_start_review()
+        else:
+            self.navigate("schedule")
+
     def refresh(self) -> None:
         counts = self.db.dashboard_counts()
+
+        today = self.db.today_automation_summary()
+        pending = int(today.get("pending_review_today", 0))
+        scheduled = int(today.get("scheduled_today", 0))
+        published = int(today.get("published_today", 0))
+        failed = int(today.get("failed_today", 0))
+        total_today = pending + scheduled + published + failed
+        self.today_summary_label.setText(f"今天共 {total_today} 篇")
+        self.today_detail_label.setText(
+            f"待檢核 {pending}　待發布 {scheduled}　已發布 {published}　失敗 {failed}"
+        )
 
         for key, card in self.cards.items():
             card.set_value(

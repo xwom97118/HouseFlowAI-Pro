@@ -365,9 +365,40 @@ class SettingsPage(QWidget):
         delete_form.addRow("", delete_note)
 
         layout.addWidget(delete_group)
+
+        history_group = QGroupBox("排程歷史紀錄")
+        history_form = QFormLayout(history_group)
+
+        self.history_retention_days = QSpinBox()
+        self.history_retention_days.setRange(1, 365)
+        self.history_retention_days.setSuffix(" 天")
+        self.history_retention_days.setValue(
+            int(self.db.get_setting("history_retention_days", "15") or 15)
+        )
+        history_form.addRow("排程歷史保留天數", self.history_retention_days)
+
+        history_note = QLabel(
+            "這裡清除的是 HouseFlow 資料庫裡「已完全結束」的排程紀錄列"
+            "（發布成功／失敗／已取消，且沒有還在等待的自動刪文工作），\n"
+            "跟 Facebook 上貼文本身的自動刪除是兩件事，不會刪除還在進行中的排程。"
+        )
+        history_note.setObjectName("MutedLabel")
+        history_note.setWordWrap(True)
+        history_form.addRow("", history_note)
+
+        cleanup_button = QPushButton("立即清理歷史紀錄")
+        cleanup_button.setObjectName("SecondaryButton")
+        cleanup_button.clicked.connect(self._cleanup_history_now)
+        history_form.addRow("", cleanup_button)
+
+        layout.addWidget(history_group)
         layout.addStretch()
 
         return _scrollable(content)
+
+    def _cleanup_history_now(self) -> None:
+        removed = self.db.cleanup_old_schedule_history(self.history_retention_days.value())
+        QMessageBox.information(self, "已清理歷史紀錄", f"已清除 {removed} 筆超過保留天數的排程歷史紀錄。")
 
     # ------------------------------------------------------------------
 
@@ -417,6 +448,7 @@ class SettingsPage(QWidget):
             "automation_delete_enabled": "1" if self.automation_delete_enabled.isChecked() else "0",
             "automation_default_delete_days": str(self.default_delete_days.value()),
             "automation_max_delete_retries": str(self.max_delete_retries.value()),
+            "history_retention_days": str(self.history_retention_days.value()),
         }
 
         for key, value in settings.items():

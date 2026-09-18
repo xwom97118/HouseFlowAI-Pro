@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "APP_NAME=HouseFlow"
-set "APP_VERSION=3.3.0"
+set "APP_VERSION=3.3.1"
 set "BUILD_LOG=%~dp0HouseFlow_build_log.txt"
 
 REM User data lives in %LOCALAPPDATA%\HouseFlow\ (see app/services/app_paths.py),
