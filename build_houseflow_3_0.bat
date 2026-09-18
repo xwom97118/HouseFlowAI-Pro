@@ -212,6 +212,8 @@ python -m PyInstaller ^
   --hidden-import "app.widgets.property_picker" ^
   --hidden-import "app.widgets.universal_import_dialog" ^
   --hidden-import "app.widgets.schedule_dialog" ^
+  --hidden-import "app.services.automation_engine" ^
+  --hidden-import "app.services.automation_logger" ^
   --add-data "app;app" ^
   --add-data "pw-browsers;pw-browsers" ^
   "main.py" >> "%BUILD_LOG%" 2>&1
