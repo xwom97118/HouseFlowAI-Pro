@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import QTimer, Signal
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -32,6 +32,11 @@ class PropertyPicker(QWidget):
         self._filtered_rows: list[dict[str, Any]] = []
         self._selected_id: int | None = None
 
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(250)
+        self._search_debounce.timeout.connect(self.apply_filters)
+
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
@@ -44,7 +49,7 @@ class PropertyPicker(QWidget):
             "搜尋標題、地址、價格、格局、標籤……"
         )
         self.search.textChanged.connect(
-            self.apply_filters
+            self._search_debounce.start
         )
 
         self.region = QComboBox()
@@ -200,16 +205,17 @@ class PropertyPicker(QWidget):
         self,
         property_id: int,
     ) -> None:
-        self._selected_id = int(property_id)
-
-        index = self.property_combo.findData(
-            self._selected_id
-        )
+        # 不能先設 self._selected_id 再呼叫 setCurrentIndex()——
+        # _combo_changed() 會用「新 id 跟 self._selected_id 是否相同」
+        # 判斷要不要真的 emit property_selected，先設就會被自己的防重複
+        # 邏輯擋掉，呼叫端永遠收不到通知。讓 _combo_changed() 自然處理。
+        target_id = int(property_id)
+        index = self.property_combo.findData(target_id)
 
         if index >= 0:
-            self.property_combo.setCurrentIndex(
-                index
-            )
+            self.property_combo.setCurrentIndex(index)
+        else:
+            self._selected_id = target_id
 
     def reset_filters(self) -> None:
         self.search.blockSignals(True)

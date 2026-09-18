@@ -211,6 +211,9 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 CREATE INDEX IF NOT EXISTS idx_schedules_property
                 ON schedules(property_id);
 
+                CREATE INDEX IF NOT EXISTS idx_schedules_created_at
+                ON schedules(created_at);
+
                 CREATE TABLE IF NOT EXISTS schedule_executions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     schedule_id INTEGER NOT NULL,
@@ -230,6 +233,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             )
             self._ensure_sync_source_columns(conn)
             self._ensure_schedule_columns(conn)
+            self._ensure_schedule_delete_indexes(conn)
             self.set_default_setting(conn, "ai_enabled", "0")
             self._seed_default_brand_profile(conn)
             self._seed_default_automation_settings(conn)
@@ -257,6 +261,20 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             if column not in existing:
                 conn.execute(f"ALTER TABLE schedules ADD COLUMN {column} {definition}")
 
+    def _ensure_schedule_delete_indexes(self, conn: sqlite3.Connection) -> None:
+        """delete_status/delete_at 是用 ALTER TABLE 後補上的欄位，所以索引
+        要等 _ensure_schedule_columns() 確保欄位存在之後才能建立。
+        """
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_schedules_delete_status
+            ON schedules(delete_status);
+
+            CREATE INDEX IF NOT EXISTS idx_schedules_delete_at
+            ON schedules(delete_at);
+            """
+        )
+
     def _seed_default_automation_settings(self, conn: sqlite3.Connection) -> None:
         defaults = {
             "automation_enabled": "1",
@@ -267,6 +285,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             "automation_max_delete_retries": "3",
             "minimize_to_tray": "1",
             "timezone": "Asia/Taipei",
+            "history_retention_days": "15",
         }
         for key, value in defaults.items():
             self.set_default_setting(conn, key, value)
@@ -1103,6 +1122,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         search: str = "",
         only_today: bool = False,
         limit: int = 300,
+        delete_statuses: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT s.*, p.title AS property_title, p.address AS property_address,
@@ -1117,6 +1137,11 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             placeholders = ", ".join("?" for _ in statuses)
             clauses.append(f"s.status IN ({placeholders})")
             params.extend(statuses)
+
+        if delete_statuses:
+            placeholders = ", ".join("?" for _ in delete_statuses)
+            clauses.append(f"s.delete_status IN ({placeholders})")
+            params.extend(delete_statuses)
 
         if only_today:
             clauses.append("date(s.scheduled_at) = date('now', 'localtime')")
@@ -1208,6 +1233,10 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             images=images_value,
             scheduled_at=scheduled_at.strip(),
         )
+
+    def update_schedule_time(self, schedule_id: int, scheduled_at: str) -> None:
+        """只改預定發布時間，不動文案／圖片——排程中心「修改時間」用。"""
+        self._update_schedule(schedule_id, scheduled_at=scheduled_at.strip())
 
     def mark_schedule_publishing(self, schedule_id: int) -> None:
         self._update_schedule(schedule_id, status="publishing")
@@ -1564,4 +1593,32 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 ),
                 "deleted_today": _count(f"delete_status='deleted' AND date(deleted_at) = {today}"),
             }
+
+    def cleanup_old_schedule_history(self, retention_days: int) -> int:
+        """清除 HouseFlow 這邊「已經完全結束」且超過保留天數的排程歷史
+        紀錄列——這跟 Facebook 貼文本身的自動刪除（delete_post()）是
+        兩件事：這裡只刪 HouseFlow 資料庫裡的排程紀錄列，不會觸碰
+        Facebook、也不會動到 property/sync_sources/CRM/settings/
+        Facebook session/圖片。
+
+        只有同時符合以下條件才會被清除：
+        - status 是終態（published / failed / cancelled，draft、
+          pending_review、scheduled、publishing、needs_review 永遠不會
+          被清除，因為它們還是待處理的工作）
+        - delete_status 不是 pending/deleting（代表這個 target 沒有還在
+          等待或執行中的自動刪文工作）
+        - updated_at 超過保留天數
+        """
+        retention_days = max(1, int(retention_days))
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                DELETE FROM schedules
+                WHERE status IN ('published', 'failed', 'cancelled')
+                  AND delete_status NOT IN ('pending', 'deleting')
+                  AND updated_at <= datetime('now', ?)
+                """,
+                (f"-{retention_days} days",),
+            )
+            return cur.rowcount
 

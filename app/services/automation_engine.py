@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from PySide6.QtCore import QCoreApplication, QObject, QThread, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, Signal
 
 from app.services.automation_logger import log_event
 from app.services.database import Database
@@ -75,8 +75,16 @@ class AutomationCycleWorker(QObject):
         self._qthread = QThread()
         self.moveToThread(self._qthread)
         self._qthread.started.connect(self._run)
-        self.finished.connect(self._qthread.quit)
-        self.failed.connect(self._qthread.quit)
+        # DirectConnection：quit() 要在 worker 執行緒 emit finished 的當下就
+        # 立刻執行（thread-safe，可跨執行緒呼叫），不能排到主執行緒佇列後面
+        # 才處理——呼叫端（AutomationEngine._start_cycle）比這裡先連上
+        # finished/failed，兩個 slot 都是 QueuedConnection 的話，呼叫端的
+        # handler 會先跑，裡面呼叫的 wait_and_cleanup() 會卡住主執行緒事件
+        # 佇列，擋住還沒被處理的 quit()，變成整整卡到 timeout（實測造成 ~5
+        # 秒的 GUI 凍結）。改成 DirectConnection 後 quit() 不用排隊，
+        # wait() 才能幾乎立刻回傳。
+        self.finished.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
+        self.failed.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
         self._qthread.start()
 
     def wait_and_cleanup(self, timeout_ms: int = 5000) -> None:

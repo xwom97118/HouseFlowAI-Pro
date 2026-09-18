@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QSize, Qt
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -15,6 +15,76 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+
+_THUMBNAIL_CACHE: dict[tuple[str, float, int, int], QIcon] = {}
+_THUMBNAIL_CACHE_ORDER: list[tuple[str, float, int, int]] = []
+_THUMBNAIL_CACHE_LIMIT = 400
+
+
+def get_thumbnail_icon(path: str, width: int = 150, height: int = 110) -> QIcon:
+    """縮圖快取：同一張圖片（路徑 + mtime 沒變）不會重複 decode/scale。
+    物件照片通常是相機原始解析度，來回切換物件時重複同步解碼是明顯的
+    卡頓來源，這裡用簡單的大小上限快取避免重工，不做過度複雜的 LRU。
+    """
+    try:
+        mtime = Path(path).stat().st_mtime
+    except OSError:
+        return QIcon()
+
+    key = (path, mtime, width, height)
+    cached = _THUMBNAIL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    pixmap = QPixmap(path)
+    icon = (
+        QIcon()
+        if pixmap.isNull()
+        else QIcon(
+            pixmap.scaled(
+                width, height, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+        )
+    )
+
+    _THUMBNAIL_CACHE[key] = icon
+    _THUMBNAIL_CACHE_ORDER.append(key)
+    if len(_THUMBNAIL_CACHE_ORDER) > _THUMBNAIL_CACHE_LIMIT:
+        oldest = _THUMBNAIL_CACHE_ORDER.pop(0)
+        _THUMBNAIL_CACHE.pop(oldest, None)
+
+    return icon
+
+
+def show_toast(parent: QWidget, text: str, kind: str = "success", duration_ms: int = 2600) -> None:
+    """右下角短暫顯示的非阻塞提示，取代大部分「成功」類的 QMessageBox。
+    同一個 parent 同時只保留一個 toast——這裡的操作都是使用者剛按下就
+    立刻看到結果，不需要疊加多則通知。
+    """
+    existing = parent.findChild(QFrame, "Toast")
+    if existing is not None:
+        existing.deleteLater()
+
+    toast = QFrame(parent)
+    toast.setObjectName("Toast")
+    toast.setProperty("kind", kind)
+
+    layout = QHBoxLayout(toast)
+    layout.setContentsMargins(16, 10, 16, 10)
+    label = QLabel(text)
+    label.setObjectName("ToastLabel")
+    layout.addWidget(label)
+
+    toast.adjustSize()
+    margin = 20
+    x = max(margin, parent.width() - toast.width() - margin)
+    y = max(margin, parent.height() - toast.height() - margin)
+    toast.move(x, y)
+    toast.show()
+    toast.raise_()
+
+    QTimer.singleShot(duration_ms, toast.deleteLater)
 
 
 def emoji_icon(emoji: str, size: int = 22) -> QIcon:
@@ -79,6 +149,24 @@ class MetricCard(QFrame):
 
     def set_value(self, value: int | str) -> None:
         self.value_label.setText(str(value))
+
+
+class ClickableMetricCard(MetricCard):
+    """跟 MetricCard 一樣，但可以點擊——排程中心用來把 Summary Card
+    跟下面的狀態 Tab 直接連動，不需要另外做一套篩選按鈕。
+    """
+
+    clicked = Signal()
+
+    def __init__(self, title: str, value: str = "0", subtitle: str = "") -> None:
+        super().__init__(title, value, subtitle)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setProperty("clickable", True)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
 
 
 class SectionTitle(QWidget):

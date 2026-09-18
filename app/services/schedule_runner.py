@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PySide6.QtCore import QCoreApplication, QObject, QThread, Signal
+from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, Signal
 
 from app.services.database import Database
 from app.services.facebook_service import FacebookService
@@ -26,8 +26,16 @@ class SchedulePublishRunner(QObject):
         self._qthread = QThread()
         self.moveToThread(self._qthread)
         self._qthread.started.connect(self._run)
-        self.finished.connect(self._qthread.quit)
-        self.failed.connect(self._qthread.quit)
+        # DirectConnection：quit() 要在 worker 執行緒 emit finished 的當下
+        # 就立刻執行（thread-safe，可以跨執行緒呼叫），不能排到主執行緒佇列
+        # 後面才處理——否則如果呼叫端也連了 finished/failed 且會呼叫
+        # wait_and_cleanup()，因為兩個 slot 都是 QueuedConnection、
+        # 呼叫端通常比這裡先連線，wait() 會卡在主執行緒事件佇列前面，
+        # 擋住還沒被處理的 quit()，變成整整卡住到 timeout（實測 ~5 秒的
+        # GUI 凍結）。改成 DirectConnection 後 quit() 不用排隊，wait() 才能
+        # 幾乎立刻回傳。
+        self.finished.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
+        self.failed.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
         self._qthread.start()
 
     def wait_and_cleanup(self, timeout_ms: int = 5000) -> None:
@@ -97,8 +105,16 @@ class ScheduleDeleteRunner(QObject):
         self._qthread = QThread()
         self.moveToThread(self._qthread)
         self._qthread.started.connect(self._run)
-        self.finished.connect(self._qthread.quit)
-        self.failed.connect(self._qthread.quit)
+        # DirectConnection：quit() 要在 worker 執行緒 emit finished 的當下
+        # 就立刻執行（thread-safe，可以跨執行緒呼叫），不能排到主執行緒佇列
+        # 後面才處理——否則如果呼叫端也連了 finished/failed 且會呼叫
+        # wait_and_cleanup()，因為兩個 slot 都是 QueuedConnection、
+        # 呼叫端通常比這裡先連線，wait() 會卡在主執行緒事件佇列前面，
+        # 擋住還沒被處理的 quit()，變成整整卡住到 timeout（實測 ~5 秒的
+        # GUI 凍結）。改成 DirectConnection 後 quit() 不用排隊，wait() 才能
+        # 幾乎立刻回傳。
+        self.finished.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
+        self.failed.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
         self._qthread.start()
 
     def wait_and_cleanup(self, timeout_ms: int = 5000) -> None:
@@ -134,4 +150,56 @@ class ScheduleDeleteRunner(QObject):
 
         except Exception as exc:
             self.db.mark_delete_failed_terminal(schedule_id, str(exc))
+            self.failed.emit(str(exc))
+
+
+class AdHocPublishRunner(QObject):
+    """發文中心「立即發布」用：在背景 QThread 呼叫既有的
+    FacebookService.publish_posts()（完全不改內部邏輯），避免多個
+    target 的真實瀏覽器自動化卡住 GUI 執行緒。跟 SchedulePublishRunner
+    不同的地方只有：這裡沒有對應的 schedule row 可以寫回，結果單純
+    透過 finished(dict) signal 交給呼叫端自己處理 UI。
+    """
+
+    finished = Signal(dict)
+    failed = Signal(str)
+
+    def __init__(self, targets: list[str], content: str, image_paths: list[str]) -> None:
+        super().__init__()
+        self.targets = targets
+        self.content = content
+        self.image_paths = image_paths
+        self._qthread: QThread | None = None
+
+    def start(self) -> None:
+        self._qthread = QThread()
+        self.moveToThread(self._qthread)
+        self._qthread.started.connect(self._run)
+        # DirectConnection：quit() 要在 worker 執行緒 emit finished 的當下
+        # 就立刻執行（thread-safe，可以跨執行緒呼叫），不能排到主執行緒佇列
+        # 後面才處理——否則如果呼叫端也連了 finished/failed 且會呼叫
+        # wait_and_cleanup()，因為兩個 slot 都是 QueuedConnection、
+        # 呼叫端通常比這裡先連線，wait() 會卡在主執行緒事件佇列前面，
+        # 擋住還沒被處理的 quit()，變成整整卡住到 timeout（實測 ~5 秒的
+        # GUI 凍結）。改成 DirectConnection 後 quit() 不用排隊，wait() 才能
+        # 幾乎立刻回傳。
+        self.finished.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
+        self.failed.connect(self._qthread.quit, Qt.ConnectionType.DirectConnection)
+        self._qthread.start()
+
+    def wait_and_cleanup(self, timeout_ms: int = 5000) -> None:
+        if self._qthread is None:
+            return
+        self._qthread.wait(timeout_ms)
+        app = QCoreApplication.instance()
+        if app is not None:
+            self.moveToThread(app.thread())
+        self.deleteLater()
+        self._qthread.deleteLater()
+
+    def _run(self) -> None:
+        try:
+            report = FacebookService().publish_posts(self.targets, self.content, self.image_paths)
+            self.finished.emit(report)
+        except Exception as exc:
             self.failed.emit(str(exc))
