@@ -3,7 +3,7 @@ setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "APP_NAME=HouseFlow"
-set "APP_VERSION=3.2.0"
+set "APP_VERSION=3.3.0"
 set "BUILD_LOG=%~dp0HouseFlow_build_log.txt"
 
 REM User data lives in %LOCALAPPDATA%\HouseFlow\ (see app/services/app_paths.py),
@@ -214,6 +214,9 @@ python -m PyInstaller ^
   --hidden-import "app.widgets.schedule_dialog" ^
   --hidden-import "app.services.automation_engine" ^
   --hidden-import "app.services.automation_logger" ^
+  --hidden-import "app.pages.ai_center" ^
+  --hidden-import "app.pages.groups" ^
+  --hidden-import "app.pages.placeholders" ^
   --add-data "app;app" ^
   --add-data "pw-browsers;pw-browsers" ^
   "main.py" >> "%BUILD_LOG%" 2>&1
