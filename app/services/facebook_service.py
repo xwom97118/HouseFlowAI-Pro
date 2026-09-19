@@ -14,6 +14,7 @@ from playwright.sync_api import (
 )
 
 from app.services import app_paths
+from app.services.browser_runtime import verify_bundled_browser_or_raise
 
 
 class FacebookService:
@@ -1078,6 +1079,10 @@ class FacebookService:
         self,
         playwright: Playwright,
     ) -> BrowserContext:
+        # 防呆檢查：確認隨附的 Chromium 真的存在，避免拋出很難懂的
+        # [WinError 2] 系統找不到指定的檔案（見 browser_runtime.py 的說明）。
+        verify_bundled_browser_or_raise()
+
         context = (
             playwright.chromium
             .launch_persistent_context(

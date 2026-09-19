@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
+import traceback
 import uuid
 from typing import Any
 
 from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, Signal
 
-from app.services.automation_logger import log_event
+from app.services.automation_logger import log_event, log_heartbeat
 from app.services.database import Database
 from app.services.facebook_service import FacebookService
 from app.services.sync_runner import SyncAlreadyRunningError, execute_source_sync
@@ -125,6 +126,7 @@ class AutomationCycleWorker(QObject):
         }
 
         try:
+            log_heartbeat("cycle starting")
             self._recover_stale(summary)
             login_blocked = self._process_publishes(summary)
             if not login_blocked:
@@ -179,7 +181,14 @@ class AutomationCycleWorker(QObject):
                 results = report.get("results", [])
                 result = results[0] if results else {"success": False, "message": "沒有回傳結果"}
             except Exception as exc:
-                result = {"success": False, "message": str(exc)}
+                # 不能只留 str(exc)（例如單純一句「[WinError 2] 系統找不到
+                # 指定的檔案」）——加上例外類型，並把完整 traceback 寫進
+                # log，2026-09-19 的事故就是靠這個才追出真正原因。
+                result = {"success": False, "message": f"{type(exc).__name__}: {exc}"}
+                log_event(
+                    "publish_exception",
+                    f"schedule_id={schedule_id} {type(exc).__name__}: {exc}\n{traceback.format_exc()}",
+                )
 
             if result.get("success"):
                 # 注意：facebook_service.publish_posts() 目前不會回傳可靠
@@ -189,7 +198,9 @@ class AutomationCycleWorker(QObject):
                 self.db.mark_schedule_published(schedule_id, post_url="", post_id="")
                 self.db.finish_execution(execution_id, "success")
                 summary["published"] += 1
-                log_event("publish_success", f"schedule_id={schedule_id}")
+                # post_url/post_id 目前永遠是空字串（見上方註解），記錄下來
+                # 是刻意的——之後補上可靠識別方式時，這行 log 格式不用改。
+                log_event("publish_success", f"schedule_id={schedule_id} post_url= post_id=")
                 continue
 
             message = str(result.get("message", "") or "未知錯誤")
@@ -201,14 +212,14 @@ class AutomationCycleWorker(QObject):
                 self.db.schedule_publish_retry(schedule_id, {"minutes": 0}, message)
                 self.db.finish_execution(execution_id, "needs_review", message)
                 summary["login_required"] = True
-                log_event("login_required", f"schedule_id={schedule_id}")
+                log_event("login_required", f"schedule_id={schedule_id} reason={message}")
                 return True
 
             if classification == "needs_review":
                 self.db.mark_schedule_needs_review(schedule_id, message)
                 self.db.finish_execution(execution_id, "needs_review", message)
                 summary["needs_review"] += 1
-                log_event("publish_needs_review", f"schedule_id={schedule_id}")
+                log_event("publish_needs_review", f"schedule_id={schedule_id} reason={message}")
                 continue
 
             # classification == "failed"：明確失敗，可以照規則重試。
@@ -216,7 +227,10 @@ class AutomationCycleWorker(QObject):
                 self.db.mark_schedule_failed(schedule_id, message)
                 self.db.finish_execution(execution_id, "failed", message)
                 summary["failed"] += 1
-                log_event("publish_failed", f"schedule_id={schedule_id} attempt={attempt_number}（終止重試）")
+                log_event(
+                    "publish_failed",
+                    f"schedule_id={schedule_id} attempt={attempt_number}（終止重試） reason={message}",
+                )
             else:
                 backoff_minutes = PUBLISH_RETRY_BACKOFF_MINUTES[
                     min(attempt_number - 1, len(PUBLISH_RETRY_BACKOFF_MINUTES) - 1)
@@ -225,7 +239,7 @@ class AutomationCycleWorker(QObject):
                 self.db.finish_execution(execution_id, "failed", message)
                 log_event(
                     "publish_retry_scheduled",
-                    f"schedule_id={schedule_id} attempt={attempt_number} 等待 {backoff_minutes} 分鐘",
+                    f"schedule_id={schedule_id} attempt={attempt_number} 等待 {backoff_minutes} 分鐘 reason={message}",
                 )
 
         return False

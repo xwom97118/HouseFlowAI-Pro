@@ -34,6 +34,35 @@ def ensure_playwright_browsers_path() -> None:
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers_dir)
 
 
+class BundledBrowserMissingError(RuntimeError):
+    """封裝版 HouseFlow 找不到隨附的 Chromium 執行檔。"""
+
+
+def verify_bundled_browser_or_raise() -> None:
+    """在真的呼叫 Playwright 啟動瀏覽器之前先確認執行檔存在。
+
+    2026-09-19 發生過一次事故：部署流程在 HouseFlow 還在執行中的時候把
+    _internal/pw-browsers 刪除，背景排程到期要發文時，Playwright 嘗試
+    啟動一個已經不存在的 chrome.exe，只拋出很難懂的
+    [WinError 2] 系統找不到指定的檔案，DB 跟 log 裡完全看不出真正原因。
+    這裡提前擋下來，給一個可以直接採取行動的錯誤訊息。
+
+    只在封裝後（frozen）執行時檢查；開發模式沒有隨附的 pw-browsers 資料
+    夾，沿用 Playwright 自己在 %LOCALAPPDATA%\\ms-playwright 的預設行為。
+    """
+    if not getattr(sys, "frozen", False):
+        return
+
+    status = browser_runtime_status()
+    if not status["bundled_found"] or not status["chrome_path"]:
+        raise BundledBrowserMissingError(
+            "Facebook 自動化找不到隨附的瀏覽器元件（Chromium）。\n"
+            f"預期路徑：{status['browsers_dir']}\n"
+            "請重新安裝／重新部署 HouseFlow"
+            "（部署時請先關閉正在執行中的 HouseFlow，避免執行中被刪除執行檔）。"
+        )
+
+
 def browser_runtime_status() -> dict:
     """回傳目前 Chromium 執行環境狀態，供設定頁 / 診斷使用。"""
     browsers_dir = bundled_browsers_dir()

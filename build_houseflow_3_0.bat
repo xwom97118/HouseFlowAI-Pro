@@ -43,6 +43,26 @@ if errorlevel 1 (
     goto :failed
 )
 
+REM Deployment safety: a 2026-09-19 incident deleted a still-running
+REM HouseFlow.exe's bundled Chromium out from under it mid-deploy
+REM (rmdir succeeded on unlocked files even though the exe itself was
+REM open), which silently broke that live process's ability to launch
+REM a browser and caused 3 real scheduled Facebook posts to fail with
+REM a cryptic WinError 2. Never again: refuse to touch Desktop\HouseFlow
+REM while HouseFlow.exe is running, checked both here (fail fast, before
+REM spending minutes on pip/PyInstaller) and again right before the
+REM deploy step in case it was launched during the build.
+tasklist /FI "IMAGENAME eq HouseFlow.exe" 2>NUL | find /I "HouseFlow.exe" >NUL
+if not errorlevel 1 (
+    echo.
+    echo ==================================================
+    echo   HouseFlow is currently running.
+    echo   Close HouseFlow before deploying the new version.
+    echo ==================================================
+    echo.
+    goto :failed
+)
+
 echo Build started: %date% %time% > "%BUILD_LOG%"
 echo Project folder: %CD% >> "%BUILD_LOG%"
 echo. >> "%BUILD_LOG%"
@@ -231,6 +251,22 @@ if not exist "dist\HouseFlow\HouseFlow.exe" (
 echo [7/7] Copying application files to desktop...
 REM This only replaces the application/runtime folder. User data lives in
 REM %LOCALAPPDATA%\HouseFlow\ and is never touched by this step.
+
+REM Second check, right before the destructive rmdir: the build above took
+REM several minutes, so re-verify HouseFlow wasn't launched in the meantime.
+tasklist /FI "IMAGENAME eq HouseFlow.exe" 2>NUL | find /I "HouseFlow.exe" >NUL
+if not errorlevel 1 (
+    echo.
+    echo ==================================================
+    echo   HouseFlow is currently running.
+    echo   Close HouseFlow before deploying the new version.
+    echo   The build succeeded and is sitting in dist\HouseFlow -
+    echo   rerun this script after closing HouseFlow to deploy it.
+    echo ==================================================
+    echo.
+    goto :failed
+)
+
 if exist "%DESKTOP%\HouseFlow" rmdir /s /q "%DESKTOP%\HouseFlow"
 xcopy "dist\HouseFlow" "%DESKTOP%\HouseFlow\" /E /I /H /Y >nul
 if errorlevel 1 goto :failed
