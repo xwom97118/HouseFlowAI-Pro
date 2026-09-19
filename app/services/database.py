@@ -232,6 +232,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 """
             )
             self._ensure_sync_source_columns(conn)
+            self._ensure_sync_source_indexes(conn)
             self._ensure_schedule_columns(conn)
             self._ensure_schedule_delete_indexes(conn)
             self.set_default_setting(conn, "ai_enabled", "0")
@@ -286,22 +287,52 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             "minimize_to_tray": "1",
             "timezone": "Asia/Taipei",
             "history_retention_days": "15",
+            "automation_sync_enabled": "1",
+            "automation_sync_max_concurrent": "1",
+            "automation_sync_timeout_seconds": "120",
+            "automation_sync_max_retries": "3",
+            "sync_history_retention_days": "30",
         }
         for key, value in defaults.items():
             self.set_default_setting(conn, key, value)
 
     def _ensure_sync_source_columns(self, conn: sqlite3.Connection) -> None:
-        """3.5 自動同步會用到的欄位，先用 backward-compatible migration
-        加進來；這一輪不會真的啟動 timer，只是預留欄位。
+        """3.4 Auto Sync Center 用到的欄位：atomic claim（sync_status +
+        execution_token，跟 schedules 的 claim 模式一樣）、重試狀態、
+        累計次數。sync_interval_minutes/next_sync_at 是 3.3 就預留的
+        欄位，這裡繼續沿用，不重新建立。全部都是 backward-compatible
+        ALTER TABLE，不影響既有 sync_sources 資料。
         """
         existing = {row[1] for row in conn.execute("PRAGMA table_info(sync_sources)")}
         additions = {
             "sync_interval_minutes": "INTEGER NOT NULL DEFAULT 60",
             "next_sync_at": "TEXT NOT NULL DEFAULT ''",
+            "sync_status": "TEXT NOT NULL DEFAULT 'idle'",
+            "execution_token": "TEXT NOT NULL DEFAULT ''",
+            "last_status": "TEXT NOT NULL DEFAULT ''",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+            "last_success_at": "TEXT NOT NULL DEFAULT ''",
+            "last_failure_at": "TEXT NOT NULL DEFAULT ''",
+            "retry_count": "INTEGER NOT NULL DEFAULT 0",
+            "next_retry_at": "TEXT NOT NULL DEFAULT ''",
+            "sync_success_count": "INTEGER NOT NULL DEFAULT 0",
+            "sync_failure_count": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, definition in additions.items():
             if column not in existing:
                 conn.execute(f"ALTER TABLE sync_sources ADD COLUMN {column} {definition}")
+
+    def _ensure_sync_source_indexes(self, conn: sqlite3.Connection) -> None:
+        """next_sync_at/sync_status 是後補欄位，索引要等欄位確定存在後才能建立。"""
+        conn.executescript(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sync_sources_next_sync
+            ON sync_sources(next_sync_at);
+
+            CREATE INDEX IF NOT EXISTS idx_sync_sources_status
+            ON sync_sources(sync_status);
+            """
+        )
 
     def _seed_default_brand_profile(self, conn: sqlite3.Connection) -> None:
         """第一次啟動時的品牌／經紀業資訊種子值。只有在該 key 完全沒有
@@ -351,6 +382,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             "source_site": "TEXT NOT NULL DEFAULT ''",
             "source_id": "INTEGER",
             "last_seen_at": "TEXT NOT NULL DEFAULT ''",
+            "missing_count": "INTEGER NOT NULL DEFAULT 0",
         }
         for column, definition in additions.items():
             if column not in existing:
@@ -621,6 +653,10 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
 
         return property_id, change
 
+    # 連續幾次同步都沒看到才真的判定下架——避免網站單次抓取不完整就
+    # 誤判一堆物件下架。見 TEST G/H（一次沒看到不下架、連續三次才下架）。
+    OFFLINE_MISSING_THRESHOLD = 3
+
     def _mark_offline_properties(
         self,
         conn: sqlite3.Connection,
@@ -628,6 +664,17 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         seen_ids: list[int],
         sync_run_id: int | None,
     ) -> int:
+        # 這次有看到的物件，下線倒數重新歸零（不管之前累積到第幾次）。
+        if seen_ids:
+            seen_placeholders = ", ".join("?" for _ in seen_ids)
+            conn.execute(
+                f"""
+                UPDATE properties SET missing_count=0
+                WHERE source_id=? AND id IN ({seen_placeholders})
+                """,
+                [source_id, *seen_ids],
+            )
+
         placeholders = ", ".join("?" for _ in seen_ids) if seen_ids else ""
         where_not_seen = f"AND id NOT IN ({placeholders})" if placeholders else ""
         params: list[Any] = [source_id]
@@ -635,7 +682,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
 
         candidates = conn.execute(
             f"""
-            SELECT id FROM properties
+            SELECT id, missing_count FROM properties
             WHERE source_id=? AND status != 'offline' {where_not_seen}
             """,
             params,
@@ -646,21 +693,33 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             (source_id,),
         ).fetchone()[0]
 
-        # 安全判定：單次同步不應該把來源中大部分物件都判定下架，
-        # 避免解析失敗或網站改版時誤刪一整批物件的狀態。
+        # 安全判定：單次同步不應該把來源中大部分物件都判定「這次沒看到」，
+        # 避免解析失敗或網站改版時，把一整批物件的下線倒數都往前推。
         if active_total > 0 and len(candidates) > max(3, active_total * 0.5):
             return 0
 
+        offline_count = 0
         for row in candidates:
-            conn.execute(
-                "UPDATE properties SET status='offline', updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (row["id"],),
-            )
-            self._record_property_change(
-                conn, row["id"], "offline", "active", "offline", sync_run_id
-            )
+            new_missing = int(row["missing_count"] or 0) + 1
+            if new_missing >= self.OFFLINE_MISSING_THRESHOLD:
+                conn.execute(
+                    """
+                    UPDATE properties SET status='offline', missing_count=?,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?
+                    """,
+                    (new_missing, row["id"]),
+                )
+                self._record_property_change(
+                    conn, row["id"], "offline", "active", "offline", sync_run_id
+                )
+                offline_count += 1
+            else:
+                conn.execute(
+                    "UPDATE properties SET missing_count=? WHERE id=?",
+                    (new_missing, row["id"]),
+                )
 
-        return len(candidates)
+        return offline_count
 
     @staticmethod
     def _record_property_change(
@@ -678,6 +737,34 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             """,
             (property_id, change_type, old_value, new_value, sync_run_id),
         )
+
+    def recent_property_changes_map(self, days: int = 3) -> dict[int, dict[str, Any]]:
+        """回傳 {property_id: 最重要的一筆最近異動}，物件中心用來顯示
+        🆕新物件／↓價格異動／已異動 badge。優先順序：created > price_changed
+        > content_changed（下架直接看 properties.status，不需要查這裡）。
+        """
+        priority = {"created": 3, "price_changed": 2, "content_changed": 1}
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM property_changes
+                WHERE change_type IN ('created', 'price_changed', 'content_changed')
+                  AND detected_at >= datetime('now', ?)
+                ORDER BY detected_at DESC
+                """,
+                (f"-{days} days",),
+            ).fetchall()
+
+        result: dict[int, dict[str, Any]] = {}
+        for row in rows:
+            property_id = int(row["property_id"])
+            change_type = row["change_type"]
+            existing = result.get(property_id)
+            if existing is None or priority.get(change_type, 0) > priority.get(
+                existing["change_type"], 0
+            ):
+                result[property_id] = dict(row)
+        return result
 
     def list_property_changes(
         self,
@@ -759,6 +846,11 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         url = str(data.get("url", "")).strip()
         enabled = 1 if data.get("enabled", True) else 0
         auto_sync_enabled = 1 if data.get("auto_sync_enabled", False) else 0
+        try:
+            interval = int(data.get("sync_interval_minutes", 360) or 360)
+        except (TypeError, ValueError):
+            interval = 360
+        interval = max(5, interval)
 
         if not url:
             raise ValueError("同步來源網址不可空白")
@@ -773,19 +865,21 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                     )
                 cur = conn.execute(
                     """
-                    INSERT INTO sync_sources(name, source_type, url, enabled, auto_sync_enabled)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO sync_sources(
+                        name, source_type, url, enabled, auto_sync_enabled, sync_interval_minutes
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (name, source_type, url, enabled, auto_sync_enabled),
+                    (name, source_type, url, enabled, auto_sync_enabled, interval),
                 )
                 return int(cur.lastrowid)
             conn.execute(
                 """
                 UPDATE sync_sources SET name=?, source_type=?, url=?, enabled=?,
-                    auto_sync_enabled=?, updated_at=CURRENT_TIMESTAMP
+                    auto_sync_enabled=?, sync_interval_minutes=?, updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
-                (name, source_type, url, enabled, auto_sync_enabled, source_id),
+                (name, source_type, url, enabled, auto_sync_enabled, interval, source_id),
             )
             return source_id
 
@@ -807,15 +901,144 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 (1 if enabled else 0, source_id),
             )
 
-    def touch_sync_source_last_sync(self, source_id: int) -> None:
+    # ---------------------------------------------------------------
+    # Auto Sync Center：atomic claim / retry / 完成後排下一次
+    # ---------------------------------------------------------------
+
+    def list_due_sync_sources(self, limit: int = 10) -> list[dict[str, Any]]:
+        now = now_local_str()
+        sql = """
+            SELECT * FROM sync_sources
+            WHERE enabled=1 AND auto_sync_enabled=1 AND sync_status='idle'
+              AND (next_sync_at='' OR next_sync_at<=?)
+            ORDER BY CASE WHEN next_sync_at='' THEN 1 ELSE 0 END, next_sync_at ASC
+            LIMIT ?
+        """
         with self.connect() as conn:
+            return [dict(row) for row in conn.execute(sql, (now, limit)).fetchall()]
+
+    def claim_sync_source_for_sync(self, source_id: int, execution_token: str) -> bool:
+        """Atomic claim：跟 schedules 的 claim_schedule_for_publish 同一個模式
+        ——只有真的把 sync_status 從 idle 改成 syncing 的那次呼叫，rowcount
+        才會是 1。手動按「立即同步」跟 Automation tick 同時打到同一個來源，
+        只有一邊搶得到，這是防止同一來源重複同步的核心機制。
+        """
+        with self.connect() as conn:
+            cur = conn.execute(
+                """
+                UPDATE sync_sources SET sync_status='syncing', execution_token=?,
+                    updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND sync_status='idle'
+                """,
+                (execution_token, source_id),
+            )
+            return cur.rowcount == 1
+
+    def count_active_properties_for_source(self, source_id: int) -> int:
+        with self.connect() as conn:
+            return int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM properties WHERE source_id=? AND status != 'offline'",
+                    (source_id,),
+                ).fetchone()[0]
+            )
+
+    def mark_sync_source_success(self, source_id: int) -> None:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT sync_interval_minutes FROM sync_sources WHERE id=?", (source_id,)
+            ).fetchone()
+            interval = int(row["sync_interval_minutes"]) if row else 360
+            now = now_local_str()
+            next_sync = local_str_plus(now, minutes=interval)
             conn.execute(
                 """
-                UPDATE sync_sources SET last_sync_at=CURRENT_TIMESTAMP,
-                    updated_at=CURRENT_TIMESTAMP WHERE id=?
+                UPDATE sync_sources SET sync_status='idle', last_status='success', last_error='',
+                    last_sync_at=?, last_success_at=?, next_sync_at=?, retry_count=0,
+                    next_retry_at='', execution_token='',
+                    sync_success_count=sync_success_count+1, updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
                 """,
-                (source_id,),
+                (now, now, next_sync, source_id),
             )
+
+    def mark_sync_source_partial_or_suspicious(self, source_id: int, status: str, error_message: str) -> None:
+        """partial/suspicious：這次有抓到結果、也寫進 DB 了（partial 是部分
+        頁面失敗，suspicious 是抓到的數量疑似不完整所以沒有做下架判斷），
+        不算失敗、不重試，只是照正常頻率排下一次，並把原因留在 last_error
+        方便使用者在來源卡片上看到。
+        """
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT sync_interval_minutes FROM sync_sources WHERE id=?", (source_id,)
+            ).fetchone()
+            interval = int(row["sync_interval_minutes"]) if row else 360
+            now = now_local_str()
+            next_sync = local_str_plus(now, minutes=interval)
+            conn.execute(
+                """
+                UPDATE sync_sources SET sync_status='idle', last_status=?, last_error=?,
+                    last_sync_at=?, next_sync_at=?, retry_count=0, next_retry_at='',
+                    execution_token='', updated_at=CURRENT_TIMESTAMP
+                WHERE id=?
+                """,
+                (status, error_message, now, next_sync, source_id),
+            )
+
+    def mark_sync_source_retry_or_fail(
+        self, source_id: int, error_message: str, max_retries: int = 3
+    ) -> None:
+        """明確失敗（例外、逾時、來源整體不可用）：前 max_retries 次用
+        5/15/30 分鐘 backoff 重試；超過後標記 needs_review，不再無限重試，
+        改回等下一個正常 sync_interval 再試一次。
+        """
+        backoff_minutes = (5, 15, 30)
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT retry_count, sync_interval_minutes FROM sync_sources WHERE id=?",
+                (source_id,),
+            ).fetchone()
+            retry_count = (int(row["retry_count"] or 0) if row else 0) + 1
+            interval = int(row["sync_interval_minutes"]) if row else 360
+            now = now_local_str()
+
+            if retry_count > max_retries:
+                next_sync = local_str_plus(now, minutes=interval)
+                conn.execute(
+                    """
+                    UPDATE sync_sources SET sync_status='idle', last_status='needs_review',
+                        last_error=?, last_sync_at=?, last_failure_at=?, next_sync_at=?,
+                        retry_count=0, next_retry_at='', execution_token='',
+                        sync_failure_count=sync_failure_count+1, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (error_message, now, now, next_sync, source_id),
+                )
+            else:
+                delay = backoff_minutes[min(retry_count - 1, len(backoff_minutes) - 1)]
+                next_retry = local_str_plus(now, minutes=delay)
+                conn.execute(
+                    """
+                    UPDATE sync_sources SET sync_status='idle', last_status='failed',
+                        last_error=?, last_sync_at=?, last_failure_at=?, next_sync_at=?,
+                        next_retry_at=?, retry_count=?, execution_token='',
+                        sync_failure_count=sync_failure_count+1, updated_at=CURRENT_TIMESTAMP
+                    WHERE id=?
+                    """,
+                    (error_message, now, now, next_retry, next_retry, retry_count, source_id),
+                )
+
+    def cleanup_old_sync_runs(self, retention_days: int = 30) -> int:
+        """只清 sync_runs 歷史列，絕對不動 property_changes（未來分析可能
+        還會用到，這輪明確不清）。
+        """
+        retention_days = max(1, int(retention_days))
+        with self.connect() as conn:
+            cur = conn.execute(
+                "DELETE FROM sync_runs WHERE started_at <= datetime('now', ?)",
+                (f"-{retention_days} days",),
+            )
+            return cur.rowcount
 
     # ---------------------------------------------------------------
     # Sync Center：同步紀錄
@@ -892,6 +1115,9 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             today_price = conn.execute(
                 "SELECT COUNT(*) FROM property_changes WHERE change_type='price_changed' AND date(detected_at)=date('now', 'localtime')"
             ).fetchone()[0]
+            today_changed = conn.execute(
+                "SELECT COUNT(*) FROM property_changes WHERE change_type IN ('price_changed', 'content_changed') AND date(detected_at)=date('now', 'localtime')"
+            ).fetchone()[0]
             today_offline = conn.execute(
                 "SELECT COUNT(*) FROM property_changes WHERE change_type='offline' AND date(detected_at)=date('now', 'localtime')"
             ).fetchone()[0]
@@ -901,15 +1127,36 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             total_properties = conn.execute(
                 "SELECT COUNT(*) FROM properties WHERE status != 'offline'"
             ).fetchone()[0]
+            auto_sync_sources = conn.execute(
+                "SELECT COUNT(*) FROM sync_sources WHERE enabled=1 AND auto_sync_enabled=1"
+            ).fetchone()[0]
+            today_sync_runs = conn.execute(
+                "SELECT COUNT(*) FROM sync_runs WHERE date(started_at, 'localtime')=date('now', 'localtime')"
+            ).fetchone()[0]
+            next_source = conn.execute(
+                """
+                SELECT next_sync_at FROM sync_sources
+                WHERE enabled=1 AND auto_sync_enabled=1 AND next_sync_at != ''
+                ORDER BY next_sync_at ASC LIMIT 1
+                """
+            ).fetchone()
+            failing_sources = conn.execute(
+                "SELECT COUNT(*) FROM sync_sources WHERE last_status IN ('failed', 'needs_review')"
+            ).fetchone()[0]
 
         return {
             "last_sync_at": last_run["started_at"] if last_run else "",
             "last_sync_status": last_run["status"] if last_run else "",
             "today_new": today_new,
             "today_price_changed": today_price,
+            "today_changed": today_changed,
             "today_offline": today_offline,
             "today_failed": today_failed_runs,
             "total_properties": total_properties,
+            "auto_sync_sources": auto_sync_sources,
+            "today_sync_runs": today_sync_runs,
+            "next_sync_at": next_source["next_sync_at"] if next_source else "",
+            "failing_sources": failing_sources,
         }
 
     def get_note(self, property_id: int) -> dict[str, Any]:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Any
 
@@ -8,6 +9,12 @@ from PySide6.QtCore import QCoreApplication, QObject, Qt, QThread, QTimer, Signa
 from app.services.automation_logger import log_event
 from app.services.database import Database
 from app.services.facebook_service import FacebookService
+from app.services.sync_runner import SyncAlreadyRunningError, execute_source_sync
+from app.services.sync_service import YungchingSyncService
+
+# App 剛啟動時先不要立刻打一堆 network request 影響 startup UX——啟動後
+# 這段時間內，即使有到期的 auto sync source，tick 也不會去處理它。
+SYNC_STARTUP_DELAY_SECONDS = 20
 
 # 明確判定為「登入/安全驗證問題」的關鍵字 —— 這些直接沿用
 # facebook_service.py 既有 _raise_if_blocked() 本來就會拋出的訊息內容，
@@ -63,12 +70,16 @@ class AutomationCycleWorker(QObject):
         max_publish_retries: int,
         max_delete_retries: int,
         facebook_factory=FacebookService,
+        sync_service_factory=YungchingSyncService,
+        sync_phase_enabled: bool = True,
     ) -> None:
         super().__init__()
         self.db = db
         self.max_publish_retries = max_publish_retries
         self.max_delete_retries = max_delete_retries
         self.facebook_factory = facebook_factory
+        self.sync_service_factory = sync_service_factory
+        self.sync_phase_enabled = sync_phase_enabled
         self._qthread: QThread | None = None
 
     def start(self) -> None:
@@ -106,6 +117,11 @@ class AutomationCycleWorker(QObject):
             "delete_failed": 0,
             "manual_delete_required": 0,
             "login_required": False,
+            "sync_success": 0,
+            "sync_failed": 0,
+            "sync_new": 0,
+            "sync_price_changed": 0,
+            "sync_offline": 0,
         }
 
         try:
@@ -113,6 +129,10 @@ class AutomationCycleWorker(QObject):
             login_blocked = self._process_publishes(summary)
             if not login_blocked:
                 self._process_deletes(summary)
+            # Auto Sync 跟 Facebook 發文/刪文完全獨立——Facebook 登入卡住
+            # 不該影響同步整店物件，反過來同步失敗也不該擋住 Facebook 工作，
+            # 所以這裡永遠執行，不看 login_blocked。
+            self._process_due_sync_sources(summary)
             self.finished.emit(summary)
         except Exception as exc:
             self.failed.emit(str(exc))
@@ -276,6 +296,66 @@ class AutomationCycleWorker(QObject):
                     f"schedule_id={schedule_id} attempt={attempt_number} 等待 {backoff_minutes} 分鐘",
                 )
 
+    def _process_due_sync_sources(self, summary: dict[str, Any]) -> None:
+        """跟發文/刪文用一樣的「查 due → atomic claim → 執行 → 分類結果」
+        模式，但實際同步邏輯直接呼叫 execute_source_sync()（跟手動「立即
+        同步」共用同一個 pipeline，見 sync_runner.py），不是另外兜一套。
+
+        本版同一個 tick 只 sequential 處理，不會同時開很多 Chromium。
+        """
+        if not self.sync_phase_enabled:
+            return
+        if self.db.get_setting("automation_sync_enabled", "1") != "1":
+            return
+
+        max_retries = self._sync_int_setting("automation_sync_max_retries", 3)
+        max_concurrent = max(1, self._sync_int_setting("automation_sync_max_concurrent", 1))
+
+        due = self.db.list_due_sync_sources(limit=max_concurrent)
+
+        for source in due:
+            source_id = int(source["id"])
+            try:
+                payload = execute_source_sync(
+                    self.db, source, service_factory=self.sync_service_factory,
+                    max_retries=max_retries,
+                )
+            except SyncAlreadyRunningError:
+                # 手動「立即同步」正在跑同一個來源，這個 tick 安靜跳過。
+                continue
+            except Exception as exc:
+                summary["sync_failed"] += 1
+                log_event("sync_failed", f"source_id={source_id} error={exc}")
+                continue
+
+            status = payload["status"]
+            counts = payload.get("counts", {})
+            if status == "success":
+                summary["sync_success"] += 1
+                summary["sync_new"] += counts.get("new", 0)
+                summary["sync_price_changed"] += counts.get("price_changed", 0)
+                summary["sync_offline"] += counts.get("offline", 0)
+                log_event(
+                    "sync_success",
+                    f"source_id={source_id} found={payload['found']} new={counts.get('new', 0)} "
+                    f"price_changed={counts.get('price_changed', 0)} offline={counts.get('offline', 0)}",
+                )
+            elif status in ("partial", "suspicious"):
+                summary["sync_success"] += 1
+                log_event("sync_" + status, f"source_id={source_id} found={payload['found']}")
+            else:
+                summary["sync_failed"] += 1
+                log_event("sync_" + status, f"source_id={source_id}")
+
+        # 明確失敗（例外）的來源已經在 execute_source_sync() 內部處理過
+        # retry/needs_review 的狀態轉移，這裡不用重複做。
+
+    def _sync_int_setting(self, key: str, default: int) -> int:
+        try:
+            return int(self.db.get_setting(key, str(default)))
+        except ValueError:
+            return default
+
 
 class AutomationEngine(QObject):
     """常駐在主執行緒的排程器：用 QTimer 定期（預設 30 秒）觸發一次
@@ -290,10 +370,16 @@ class AutomationEngine(QObject):
     cycle_finished = Signal()  # 給 UI 刷新用（不帶資料，UI 自己重新 query）
     login_required = Signal()
 
-    def __init__(self, db: Database, facebook_factory=FacebookService) -> None:
+    def __init__(
+        self,
+        db: Database,
+        facebook_factory=FacebookService,
+        sync_service_factory=YungchingSyncService,
+    ) -> None:
         super().__init__()
         self.db = db
         self.facebook_factory = facebook_factory
+        self.sync_service_factory = sync_service_factory
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._on_tick)
@@ -303,6 +389,8 @@ class AutomationEngine(QObject):
         self._login_blocked = False
         self._rerun_requested = False
         self._started = False
+        self._start_monotonic: float | None = None
+        self._force_sync_next_cycle = False
 
     # ------------------------------------------------------------------
     # 生命週期
@@ -312,6 +400,7 @@ class AutomationEngine(QObject):
         if self._started:
             return
         self._started = True
+        self._start_monotonic = time.monotonic()
         self._apply_interval_from_settings()
         enabled = self.db.get_setting("automation_enabled", "1") == "1"
         self._paused = not enabled
@@ -381,6 +470,21 @@ class AutomationEngine(QObject):
             return
         self._start_cycle()
 
+    def sync_all_sources_now(self) -> None:
+        """Tray「立即同步所有來源」用：強制這次 cycle 一定跑 sync 階段，
+        繞過開機後的啟動延遲（使用者主動要求，不算是「一開機就打一堆
+        network request」）。
+        """
+        self._force_sync_next_cycle = True
+        self.trigger_now()
+
+    def _sync_phase_ready(self) -> bool:
+        if self._force_sync_next_cycle:
+            return True
+        if self._start_monotonic is None:
+            return True
+        return (time.monotonic() - self._start_monotonic) >= SYNC_STARTUP_DELAY_SECONDS
+
     def _on_tick(self) -> None:
         if self._paused or self._login_blocked:
             return
@@ -391,9 +495,13 @@ class AutomationEngine(QObject):
     def _start_cycle(self) -> None:
         max_publish_retries = self._int_setting("automation_max_publish_retries", 3)
         max_delete_retries = self._int_setting("automation_max_delete_retries", 3)
+        sync_phase_enabled = self._sync_phase_ready()
+        self._force_sync_next_cycle = False
 
         self._worker = AutomationCycleWorker(
-            self.db, max_publish_retries, max_delete_retries, self.facebook_factory
+            self.db, max_publish_retries, max_delete_retries, self.facebook_factory,
+            sync_service_factory=self.sync_service_factory,
+            sync_phase_enabled=sync_phase_enabled,
         )
         self._worker.finished.connect(self._on_cycle_finished)
         self._worker.failed.connect(self._on_cycle_failed)
@@ -452,6 +560,19 @@ class AutomationEngine(QObject):
 
         if deleted:
             self.notify.emit("HouseFlow：到期貼文已刪除")
+
+        sync_new = summary.get("sync_new", 0)
+        sync_price_changed = summary.get("sync_price_changed", 0)
+        sync_offline = summary.get("sync_offline", 0)
+        sync_failed = summary.get("sync_failed", 0)
+
+        # 完全沒有變更就不要一直跳通知——只有新增/異動/下架/失敗才通知。
+        if sync_new or sync_price_changed or sync_offline:
+            self.notify.emit(
+                f"HouseFlow 同步完成\n新增 {sync_new}　價格異動 {sync_price_changed}　下架 {sync_offline}"
+            )
+        if sync_failed:
+            self.notify.emit(f"⚠ HouseFlow：{sync_failed} 個來源同步失敗，將依規則自動重試")
 
     # ------------------------------------------------------------------
     # 狀態顯示
