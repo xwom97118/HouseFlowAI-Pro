@@ -56,9 +56,7 @@ class SettingsPage(QWidget):
         tabs.addTab(self._build_brand_tab(), "品牌與經紀業資訊")
         tabs.addTab(self._build_social_tab(), "社群帳號")
         tabs.addTab(self._build_ai_tab(), "AI 文案設定")
-        tabs.addTab(self._build_placeholder_tab(
-            "同步來源、自動同步排程與同步頻率設定，請至左側「同步中心」管理。"
-        ), "同步設定")
+        tabs.addTab(self._build_sync_tab(), "同步設定")
         tabs.addTab(self._build_automation_tab(), "排程設定")
         root.addWidget(tabs, 1)
 
@@ -401,6 +399,91 @@ class SettingsPage(QWidget):
         QMessageBox.information(self, "已清理歷史紀錄", f"已清除 {removed} 筆超過保留天數的排程歷史紀錄。")
 
     # ------------------------------------------------------------------
+    # 同步設定（Auto Sync Center 全域設定）
+    # ------------------------------------------------------------------
+
+    def _build_sync_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 12, 12, 0)
+        layout.setSpacing(16)
+
+        sync_group = QGroupBox("自動同步")
+        sync_form = QFormLayout(sync_group)
+
+        self.automation_sync_enabled = QCheckBox("啟用自動同步")
+        self.automation_sync_enabled.setChecked(
+            self.db.get_setting("automation_sync_enabled", "1") == "1"
+        )
+        sync_form.addRow("", self.automation_sync_enabled)
+
+        self.automation_sync_max_concurrent = QSpinBox()
+        self.automation_sync_max_concurrent.setRange(1, 5)
+        self.automation_sync_max_concurrent.setValue(
+            int(self.db.get_setting("automation_sync_max_concurrent", "1") or 1)
+        )
+        sync_form.addRow("最大同時同步來源", self.automation_sync_max_concurrent)
+
+        self.automation_sync_timeout_seconds = QSpinBox()
+        self.automation_sync_timeout_seconds.setRange(30, 600)
+        self.automation_sync_timeout_seconds.setSuffix(" 秒")
+        self.automation_sync_timeout_seconds.setValue(
+            int(self.db.get_setting("automation_sync_timeout_seconds", "120") or 120)
+        )
+        sync_form.addRow("同步 timeout", self.automation_sync_timeout_seconds)
+
+        self.automation_sync_max_retries = QSpinBox()
+        self.automation_sync_max_retries.setRange(0, 10)
+        self.automation_sync_max_retries.setValue(
+            int(self.db.get_setting("automation_sync_max_retries", "3") or 3)
+        )
+        sync_form.addRow("同步失敗最大重試", self.automation_sync_max_retries)
+
+        sync_note = QLabel(
+            "本版預設 sequential 同步（同一時間只跑一個來源），避免一次開啟"
+            "太多瀏覽器。個別來源的自動同步開關與頻率請到「同步中心」的"
+            "來源卡片→「設定」調整。"
+        )
+        sync_note.setObjectName("MutedLabel")
+        sync_note.setWordWrap(True)
+        sync_form.addRow("", sync_note)
+
+        layout.addWidget(sync_group)
+
+        history_group = QGroupBox("同步歷史紀錄")
+        history_form = QFormLayout(history_group)
+
+        self.sync_history_retention_days = QSpinBox()
+        self.sync_history_retention_days.setRange(1, 365)
+        self.sync_history_retention_days.setSuffix(" 天")
+        self.sync_history_retention_days.setValue(
+            int(self.db.get_setting("sync_history_retention_days", "30") or 30)
+        )
+        history_form.addRow("同步歷史保留天數", self.sync_history_retention_days)
+
+        sync_history_note = QLabel(
+            "這裡只清除 sync_runs 同步紀錄列，不會刪除 property_changes"
+            "（新增／異動／下架紀錄，未來分析可能會用到，這一輪不自動清除）。"
+        )
+        sync_history_note.setObjectName("MutedLabel")
+        sync_history_note.setWordWrap(True)
+        history_form.addRow("", sync_history_note)
+
+        sync_cleanup_button = QPushButton("立即清理同步歷史")
+        sync_cleanup_button.setObjectName("SecondaryButton")
+        sync_cleanup_button.clicked.connect(self._cleanup_sync_history_now)
+        history_form.addRow("", sync_cleanup_button)
+
+        layout.addWidget(history_group)
+        layout.addStretch()
+
+        return _scrollable(content)
+
+    def _cleanup_sync_history_now(self) -> None:
+        removed = self.db.cleanup_old_sync_runs(self.sync_history_retention_days.value())
+        QMessageBox.information(self, "已清理同步歷史", f"已清除 {removed} 筆超過保留天數的同步歷史紀錄。")
+
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_placeholder_tab(message: str) -> QWidget:
@@ -449,6 +532,11 @@ class SettingsPage(QWidget):
             "automation_default_delete_days": str(self.default_delete_days.value()),
             "automation_max_delete_retries": str(self.max_delete_retries.value()),
             "history_retention_days": str(self.history_retention_days.value()),
+            "automation_sync_enabled": "1" if self.automation_sync_enabled.isChecked() else "0",
+            "automation_sync_max_concurrent": str(self.automation_sync_max_concurrent.value()),
+            "automation_sync_timeout_seconds": str(self.automation_sync_timeout_seconds.value()),
+            "automation_sync_max_retries": str(self.automation_sync_max_retries.value()),
+            "sync_history_retention_days": str(self.sync_history_retention_days.value()),
         }
 
         for key, value in settings.items():

@@ -205,6 +205,7 @@ class MainWindow(QMainWindow):
         self.engine.start()
         self.engine.trigger_now()  # 開機立即跑一次：復原卡住的排程、補上睡眠/關機期間錯過的到期工作
         self._sync_automation_toggle_label()
+        self._update_tray_next_sync_text()
 
     # ------------------------------------------------------------------
     # 系統匣 + Automation Engine
@@ -226,6 +227,12 @@ class MainWindow(QMainWindow):
 
         check_now_action = menu.addAction("立即檢查排程")
         check_now_action.triggered.connect(lambda: self.engine.trigger_now())
+
+        sync_now_action = menu.addAction("立即同步所有來源")
+        sync_now_action.triggered.connect(lambda: self.engine.sync_all_sources_now())
+
+        self.tray_next_sync_action = menu.addAction("下一次自動同步：—")
+        self.tray_next_sync_action.setEnabled(False)
 
         menu.addSeparator()
         quit_action = menu.addAction("退出HouseFlow")
@@ -279,7 +286,22 @@ class MainWindow(QMainWindow):
         schedule_page = self.pages.get("schedule")
         if schedule_page is not None and hasattr(schedule_page, "refresh"):
             schedule_page.refresh()
+        sync_page = self.pages.get("sync_center")
+        if sync_page is not None and hasattr(sync_page, "refresh"):
+            sync_page.refresh()
         self._on_dashboard_relevant_change()
+        self._update_tray_next_sync_text()
+
+    def _update_tray_next_sync_text(self) -> None:
+        if not hasattr(self, "tray_next_sync_action"):
+            return
+        sync_on = self.db.get_setting("automation_sync_enabled", "1") == "1"
+        if not sync_on:
+            self.tray_next_sync_action.setText("自動同步已關閉")
+            return
+        summary = self.db.sync_dashboard_summary()
+        next_sync = summary.get("next_sync_at") or "—"
+        self.tray_next_sync_action.setText(f"下一次自動同步：{next_sync}")
 
     def _on_automation_login_required(self) -> None:
         # 視窗已經被最小化到系統匣時不跳出遮住畫面的對話框——tray 通知
@@ -426,6 +448,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "engine"):
             self.engine.sync_from_settings()
             self._sync_automation_toggle_label()
+            self._update_tray_next_sync_text()
 
     def _on_start_review(self) -> None:
         schedule_page = self.pages.get("schedule")

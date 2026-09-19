@@ -173,6 +173,37 @@ class DashboardPage(QWidget):
 
         root.addWidget(today_card)
 
+        sync_card = QFrame()
+        sync_card.setObjectName("DashboardPanel")
+        sync_layout = QHBoxLayout(sync_card)
+        sync_layout.setContentsMargins(22, 18, 22, 18)
+        sync_layout.setSpacing(18)
+
+        sync_text = QVBoxLayout()
+        sync_text.setSpacing(4)
+        sync_title = QLabel("🔄 同步狀態")
+        sync_title.setObjectName("PanelTitle")
+        self.sync_status_label = QLabel("自動同步：● 運行中")
+        self.sync_status_label.setObjectName("PanelSubtitle")
+        self.sync_detail_label = QLabel("來源 0　下次同步 —　今日新增 0　今日異動 0")
+        self.sync_detail_label.setObjectName("Muted")
+        self.sync_warning_label = QLabel("")
+        self.sync_warning_label.setObjectName("WarningText")
+        self.sync_warning_label.setVisible(False)
+        sync_text.addWidget(sync_title)
+        sync_text.addWidget(self.sync_status_label)
+        sync_text.addWidget(self.sync_detail_label)
+        sync_text.addWidget(self.sync_warning_label)
+
+        sync_layout.addLayout(sync_text, 1)
+
+        self.view_sync_center_button = QPushButton("查看同步中心")
+        self.view_sync_center_button.setObjectName("SecondaryButton")
+        self.view_sync_center_button.clicked.connect(lambda: self.navigate("sync_center"))
+        sync_layout.addWidget(self.view_sync_center_button)
+
+        root.addWidget(sync_card)
+
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(14)
         metrics.setVerticalSpacing(14)
@@ -438,6 +469,29 @@ class DashboardPage(QWidget):
         self.today_detail_label.setText(
             f"待檢核 {pending}　待發布 {scheduled}　已發布 {published}　失敗 {failed}"
         )
+
+        sync_summary = self.db.sync_dashboard_summary()
+        automation_on = self.db.get_setting("automation_enabled", "1") == "1"
+        sync_on = self.db.get_setting("automation_sync_enabled", "1") == "1"
+        if automation_on and sync_on:
+            self.sync_status_label.setText("自動同步：● 運行中")
+        else:
+            self.sync_status_label.setText("自動同步：○ 已關閉")
+
+        next_sync = sync_summary.get("next_sync_at") or "—"
+        self.sync_detail_label.setText(
+            f"來源 {sync_summary.get('auto_sync_sources', 0)}　"
+            f"下次同步 {next_sync}　"
+            f"今日新增 {sync_summary.get('today_new', 0)}　"
+            f"今日異動 {sync_summary.get('today_changed', 0)}"
+        )
+
+        failing = int(sync_summary.get("failing_sources", 0))
+        if failing:
+            self.sync_warning_label.setText(f"⚠ {failing} 個來源同步失敗")
+            self.sync_warning_label.setVisible(True)
+        else:
+            self.sync_warning_label.setVisible(False)
 
         for key, card in self.cards.items():
             card.set_value(

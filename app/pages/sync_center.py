@@ -5,10 +5,12 @@ from collections.abc import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -16,6 +18,9 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QRadioButton,
+    QScrollArea,
+    QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -25,29 +30,117 @@ from PySide6.QtWidgets import (
 
 from app.services.database import Database, DuplicateSyncSourceError
 from app.services.sync_runner import SyncRunner
-from app.widgets.common import MetricCard, SectionTitle
+from app.widgets.common import MetricCard, SectionTitle, show_toast
 from app.widgets.universal_import_dialog import UniversalImportDialog
 
 SOURCE_TYPE_LABELS = {
     "yungching_store": "永慶／台慶店頭整店同步",
 }
 
-STATUS_LABELS = {
+RUN_STATUS_LABELS = {
     "running": "同步中",
     "success": "成功",
     "partial": "部分成功",
+    "suspicious": "結果可疑",
     "failed": "失敗",
     "cancelled": "已取消",
 }
+
+LAST_STATUS_LABELS = {
+    "": "尚未同步",
+    "success": "✓ 成功",
+    "partial": "~ 部分成功",
+    "suspicious": "⚠ 結果可疑",
+    "failed": "✕ 失敗",
+    "needs_review": "⚠ 需要確認",
+    "cancelled": "已取消",
+}
+
+CHANGE_TYPE_LABELS = {
+    "created": "新增物件",
+    "price_changed": "價格異動",
+    "content_changed": "內容異動",
+    "offline": "已下架",
+    "online_again": "重新上架",
+}
+
+
+class SyncIntervalSelector(QWidget):
+    """自動同步頻率：30分/1/3/6/12/24小時或自訂分鐘數。預設每 6 小時，
+    但不是寫死──實際預設值存在 DB 的 sync_interval_minutes 欄位。
+    """
+
+    PRESETS = (
+        (30, "每 30 分鐘"),
+        (60, "每 1 小時"),
+        (180, "每 3 小時"),
+        (360, "每 6 小時"),
+        (720, "每 12 小時"),
+        (1440, "每 24 小時"),
+    )
+
+    def __init__(self, current_minutes: int | None = None) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        self.group = QButtonGroup(self)
+        self.radios: list[tuple[QRadioButton, int]] = []
+
+        preset_row = QHBoxLayout()
+        for minutes, label in self.PRESETS:
+            radio = QRadioButton(label)
+            self.group.addButton(radio)
+            self.radios.append((radio, minutes))
+            preset_row.addWidget(radio)
+        layout.addLayout(preset_row)
+
+        custom_row = QHBoxLayout()
+        self.custom_radio = QRadioButton("自訂")
+        self.group.addButton(self.custom_radio)
+        self.custom_minutes = QSpinBox()
+        self.custom_minutes.setRange(5, 10080)
+        self.custom_minutes.setSuffix(" 分鐘")
+        custom_row.addWidget(self.custom_radio)
+        custom_row.addWidget(self.custom_minutes)
+        custom_row.addStretch()
+        layout.addLayout(custom_row)
+
+        default_minutes = current_minutes if current_minutes is not None else 360
+        matched = next((r for r, m in self.radios if m == default_minutes), None)
+        if matched is not None:
+            matched.setChecked(True)
+            self.custom_minutes.setValue(default_minutes)
+        else:
+            self.custom_radio.setChecked(True)
+            self.custom_minutes.setValue(default_minutes)
+
+    def value(self) -> int:
+        for radio, minutes in self.radios:
+            if radio.isChecked():
+                return minutes
+        return self.custom_minutes.value()
+
+
+def format_interval(minutes: int) -> str:
+    for preset_minutes, label in SyncIntervalSelector.PRESETS:
+        if preset_minutes == minutes:
+            return label
+    if minutes % 60 == 0:
+        return f"每 {minutes // 60} 小時"
+    return f"每 {minutes} 分鐘"
 
 
 class SyncSourceDialog(QDialog):
     """新增／編輯同步來源。"""
 
-    def __init__(self, source: dict | None = None, parent=None) -> None:
+    def __init__(self, db: Database, source: dict | None = None, parent=None) -> None:
         super().__init__(parent)
+        self.db = db
+        self.is_new = source is None
         self.setWindowTitle("編輯同步來源" if source else "新增同步來源")
-        self.resize(520, 260)
+        self.resize(560, 420)
 
         root = QVBoxLayout(self)
         form = QFormLayout()
@@ -68,11 +161,29 @@ class SyncSourceDialog(QDialog):
         self.url_input.setPlaceholderText("https://shop.yungching.com.tw/.../list/...")
         form.addRow("店頭列表網址", self.url_input)
 
-        self.auto_sync_checkbox = QCheckBox("啟用自動同步（時間排程於之後版本開放）")
-        self.auto_sync_checkbox.setChecked(bool((source or {}).get("auto_sync_enabled", 0)))
-        form.addRow("", self.auto_sync_checkbox)
-
         root.addLayout(form)
+
+        self.auto_sync_checkbox = QCheckBox("☑ 開啟自動同步")
+        self.auto_sync_checkbox.setChecked(
+            bool(int((source or {}).get("auto_sync_enabled", 0) or 0))
+        )
+        root.addWidget(self.auto_sync_checkbox)
+
+        root.addWidget(QLabel("同步頻率"))
+        current_interval = (source or {}).get("sync_interval_minutes")
+        self.interval_selector = SyncIntervalSelector(
+            int(current_interval) if current_interval else None
+        )
+        root.addWidget(self.interval_selector)
+
+        if self.is_new:
+            self.sync_now_checkbox = QCheckBox("☑ 建立後立即同步")
+            self.sync_now_checkbox.setChecked(True)
+            root.addWidget(self.sync_now_checkbox)
+        else:
+            self.sync_now_checkbox = None
+
+        root.addStretch()
 
         button_row = QHBoxLayout()
         cancel_btn = QPushButton("取消")
@@ -87,6 +198,7 @@ class SyncSourceDialog(QDialog):
         root.addLayout(button_row)
 
         self.result_data: dict | None = None
+        self.sync_now = False
 
     def _on_save(self) -> None:
         name = self.name_input.text().strip()
@@ -102,9 +214,121 @@ class SyncSourceDialog(QDialog):
             "source_type": self.type_input.currentData(),
             "url": url,
             "auto_sync_enabled": self.auto_sync_checkbox.isChecked(),
+            "sync_interval_minutes": self.interval_selector.value(),
             "enabled": True,
         }
+        self.sync_now = bool(self.sync_now_checkbox and self.sync_now_checkbox.isChecked())
         self.accept()
+
+
+class SourceCard(QFrame):
+    """一個同步來源的卡片：名稱/網址/物件數/上次同步/下次同步/頻率/
+    上次結果，加上 [立即同步][設定][停用] 三個動作，不需要使用者理解
+    database table。
+    """
+
+    def __init__(
+        self,
+        source: dict,
+        property_count: int,
+        on_sync_now: Callable[[dict], None],
+        on_settings: Callable[[dict], None],
+        on_toggle: Callable[[dict], None],
+        on_delete: Callable[[dict], None],
+        is_syncing: bool,
+    ) -> None:
+        super().__init__()
+        self.setObjectName("Card")
+        self.source = source
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 14, 18, 14)
+        layout.setSpacing(6)
+
+        header_row = QHBoxLayout()
+        name_label = QLabel(str(source.get("name", "")))
+        name_label.setObjectName("StepTitle")
+        header_row.addWidget(name_label)
+
+        enabled = bool(int(source.get("enabled", 0) or 0))
+        auto_sync = bool(int(source.get("auto_sync_enabled", 0) or 0))
+        if not enabled:
+            status_text, status_kind = "● 已停用", "neutral"
+        elif is_syncing:
+            status_text, status_kind = "⏳ 同步中", "info"
+        elif auto_sync:
+            status_text, status_kind = "● 自動同步開啟", "success"
+        else:
+            status_text, status_kind = "○ 自動同步關閉", "neutral"
+        status_label = QLabel(status_text)
+        status_label.setObjectName("StatusBadge")
+        status_label.setProperty("kind", status_kind)
+        header_row.addWidget(status_label)
+        header_row.addStretch()
+        layout.addLayout(header_row)
+
+        url_label = QLabel(str(source.get("url", "")))
+        url_label.setObjectName("Muted")
+        url_label.setWordWrap(True)
+        layout.addWidget(url_label)
+
+        info_row = QHBoxLayout()
+        info_row.setSpacing(24)
+
+        def _info(title: str, value: str) -> QVBoxLayout:
+            box = QVBoxLayout()
+            box.setSpacing(1)
+            t = QLabel(title)
+            t.setObjectName("Muted")
+            v = QLabel(value)
+            box.addWidget(t)
+            box.addWidget(v)
+            return box
+
+        info_row.addLayout(_info("物件", str(property_count)))
+        info_row.addLayout(_info("上次同步", str(source.get("last_sync_at") or "尚未同步")))
+        next_sync_text = (
+            str(source.get("next_sync_at")) if auto_sync and source.get("next_sync_at") else
+            ("待排程" if auto_sync else "—")
+        )
+        info_row.addLayout(_info("下次同步", next_sync_text))
+        info_row.addLayout(_info("頻率", format_interval(int(source.get("sync_interval_minutes") or 360))))
+        last_status = str(source.get("last_status") or "")
+        result_text = LAST_STATUS_LABELS.get(last_status, last_status)
+        info_row.addLayout(_info("上次結果", result_text))
+        info_row.addStretch()
+        layout.addLayout(info_row)
+
+        if last_status in ("failed", "needs_review") and source.get("last_error"):
+            error_label = QLabel(f"⚠ {source.get('last_error')}")
+            error_label.setObjectName("WarningText")
+            error_label.setWordWrap(True)
+            layout.addWidget(error_label)
+
+        action_row = QHBoxLayout()
+        sync_btn = QPushButton("同步中…" if is_syncing else "立即同步")
+        sync_btn.setObjectName("PrimaryButton")
+        sync_btn.setEnabled(enabled and not is_syncing)
+        sync_btn.clicked.connect(lambda: on_sync_now(source))
+
+        settings_btn = QPushButton("設定")
+        settings_btn.setObjectName("SecondaryButton")
+        settings_btn.clicked.connect(lambda: on_settings(source))
+
+        toggle_btn = QPushButton("停用" if enabled else "啟用")
+        toggle_btn.setObjectName("SecondaryButton")
+        toggle_btn.clicked.connect(lambda: on_toggle(source))
+
+        delete_btn = QPushButton("刪除")
+        delete_btn.setObjectName("SecondaryButton")
+        delete_btn.clicked.connect(lambda: on_delete(source))
+
+        action_row.addWidget(sync_btn)
+        action_row.addWidget(settings_btn)
+        action_row.addWidget(toggle_btn)
+        action_row.addWidget(delete_btn)
+        action_row.addStretch()
+        layout.addLayout(action_row)
 
 
 class SyncCenterPage(QWidget):
@@ -122,7 +346,17 @@ class SyncCenterPage(QWidget):
         self.runner: SyncRunner | None = None
         self.active_source_id: int | None = None
 
-        root = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll)
+
+        content = QWidget()
+        scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
         root.setContentsMargins(24, 22, 24, 24)
         root.setSpacing(14)
 
@@ -132,22 +366,22 @@ class SyncCenterPage(QWidget):
         back_btn.clicked.connect(lambda _=False: self.go_dashboard())
         title_row.addWidget(back_btn)
         title_row.addWidget(
-            SectionTitle("同步中心", "管理整店同步來源、單一物件匯入與同步歷史。"),
+            SectionTitle("同步中心", "Auto Sync Control Center — 管理自動同步來源、單一物件匯入與同步歷史。"),
             1,
         )
         root.addLayout(title_row)
 
         cards_row = QHBoxLayout()
-        self.card_last_sync = MetricCard("最後同步", "尚未同步")
-        self.card_new = MetricCard("今日新增", "0")
-        self.card_price = MetricCard("今日價格異動", "0")
-        self.card_offline = MetricCard("今日下架", "0")
-        self.card_failed = MetricCard("今日失敗次數", "0")
+        self.card_auto_sources = MetricCard("自動同步來源", "0")
+        self.card_today_runs = MetricCard("今日同步次數", "0")
+        self.card_new = MetricCard("今日新增物件", "0")
+        self.card_changed = MetricCard("今日異動", "0")
+        self.card_failed = MetricCard("今日失敗", "0")
         for card in (
-            self.card_last_sync,
+            self.card_auto_sources,
+            self.card_today_runs,
             self.card_new,
-            self.card_price,
-            self.card_offline,
+            self.card_changed,
             self.card_failed,
         ):
             cards_row.addWidget(card, 1)
@@ -158,37 +392,17 @@ class SyncCenterPage(QWidget):
         add_btn.setObjectName("PrimaryButton")
         add_btn.clicked.connect(self.add_source)
 
-        self.sync_now_btn = QPushButton("立即同步")
-        self.sync_now_btn.setObjectName("PrimaryButton")
-        self.sync_now_btn.clicked.connect(self.sync_selected_source)
-
         self.cancel_btn = QPushButton("取消同步")
         self.cancel_btn.setObjectName("SecondaryButton")
         self.cancel_btn.clicked.connect(self.cancel_sync)
         self.cancel_btn.setEnabled(False)
-
-        edit_btn = QPushButton("編輯")
-        edit_btn.setObjectName("SecondaryButton")
-        edit_btn.clicked.connect(self.edit_source)
-
-        self.toggle_btn = QPushButton("停用／啟用")
-        self.toggle_btn.setObjectName("SecondaryButton")
-        self.toggle_btn.clicked.connect(self.toggle_source)
-
-        delete_btn = QPushButton("刪除")
-        delete_btn.setObjectName("SecondaryButton")
-        delete_btn.clicked.connect(self.delete_source)
 
         import_btn = QPushButton("＋ 匯入單一物件網址")
         import_btn.setObjectName("SecondaryButton")
         import_btn.clicked.connect(self.open_universal_import)
 
         toolbar.addWidget(add_btn)
-        toolbar.addWidget(self.sync_now_btn)
         toolbar.addWidget(self.cancel_btn)
-        toolbar.addWidget(edit_btn)
-        toolbar.addWidget(self.toggle_btn)
-        toolbar.addWidget(delete_btn)
         toolbar.addStretch()
         toolbar.addWidget(import_btn)
         root.addLayout(toolbar)
@@ -204,21 +418,21 @@ class SyncCenterPage(QWidget):
         self.status_label.setObjectName("MutedLabel")
         root.addWidget(self.status_label)
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        root.addWidget(QLabel("同步來源"))
+        self.sources_container = QVBoxLayout()
+        self.sources_container.setSpacing(10)
+        root.addLayout(self.sources_container)
 
-        self.source_table = QTableWidget(0, 7)
-        self.source_table.setHorizontalHeaderLabels(
-            ["名稱", "網址", "類型", "啟用", "自動同步", "最後同步", "狀態"]
-        )
-        self.source_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.source_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.source_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.source_table.horizontalHeader().setStretchLastSection(True)
-        self.source_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
-        self.source_table.verticalHeader().setVisible(False)
-        splitter.addWidget(self.source_table)
+        root.addWidget(SectionTitle("最近異動", "新增物件、價格異動、下架與重新上架，最近 20 筆。"))
+        self.changes_table = QTableWidget(0, 3)
+        self.changes_table.setHorizontalHeaderLabels(["時間", "物件", "異動內容"])
+        self.changes_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.changes_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.changes_table.horizontalHeader().setStretchLastSection(True)
+        self.changes_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.changes_table.verticalHeader().setVisible(False)
+        self.changes_table.setMaximumHeight(220)
+        root.addWidget(self.changes_table)
 
         history_box = QWidget()
         history_layout = QVBoxLayout(history_box)
@@ -234,12 +448,9 @@ class SyncCenterPage(QWidget):
         self.history_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.history_table.horizontalHeader().setStretchLastSection(True)
         self.history_table.verticalHeader().setVisible(False)
+        self.history_table.setMaximumHeight(260)
         history_layout.addWidget(self.history_table)
-
-        splitter.addWidget(history_box)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 1)
-        root.addWidget(splitter, 1)
+        root.addWidget(history_box)
 
         self.refresh()
 
@@ -250,45 +461,66 @@ class SyncCenterPage(QWidget):
     def refresh(self) -> None:
         self._refresh_summary()
         self._refresh_sources()
+        self._refresh_changes()
         self._refresh_history()
 
     def _refresh_summary(self) -> None:
         summary = self.db.sync_dashboard_summary()
-        last_sync = summary.get("last_sync_at") or "尚未同步"
-        self.card_last_sync.set_value(last_sync)
+        self.card_auto_sources.set_value(summary.get("auto_sync_sources", 0))
+        self.card_today_runs.set_value(summary.get("today_sync_runs", 0))
         self.card_new.set_value(summary.get("today_new", 0))
-        self.card_price.set_value(summary.get("today_price_changed", 0))
-        self.card_offline.set_value(summary.get("today_offline", 0))
+        self.card_changed.set_value(summary.get("today_changed", 0))
         self.card_failed.set_value(summary.get("today_failed", 0))
 
+    def _clear_source_cards(self) -> None:
+        while self.sources_container.count():
+            item = self.sources_container.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
     def _refresh_sources(self) -> None:
-        selected_id = self.selected_source_id()
         self.sources = self.db.list_sync_sources()
-        self.source_table.setRowCount(len(self.sources))
-        selected_row = -1
-        for row_index, source in enumerate(self.sources):
-            values = [
-                source.get("name", ""),
-                source.get("url", ""),
-                SOURCE_TYPE_LABELS.get(source.get("source_type", ""), source.get("source_type", "")),
-                "是" if int(source.get("enabled", 0) or 0) else "否",
-                "是" if int(source.get("auto_sync_enabled", 0) or 0) else "否",
-                source.get("last_sync_at") or "尚未同步",
-                "執行中" if source.get("id") == self.active_source_id else "待命",
-            ]
+        self._clear_source_cards()
+
+        if not self.sources:
+            empty_label = QLabel("尚未建立同步來源。按「＋新增來源」開始第一個整店自動同步。")
+            empty_label.setObjectName("MutedLabel")
+            self.sources_container.addWidget(empty_label)
+            return
+
+        for source in self.sources:
+            source_id = int(source["id"])
+            property_count = self.db.count_active_properties_for_source(source_id)
+            is_syncing = (
+                source.get("sync_status") == "syncing" or source_id == self.active_source_id
+            )
+            card = SourceCard(
+                source, property_count,
+                on_sync_now=self.sync_source,
+                on_settings=self.edit_source,
+                on_toggle=self.toggle_source,
+                on_delete=self.delete_source,
+                is_syncing=is_syncing,
+            )
+            self.sources_container.addWidget(card)
+
+    def _refresh_changes(self) -> None:
+        changes = self.db.list_property_changes(limit=20)
+        self.changes_table.setRowCount(len(changes))
+        for row_index, change in enumerate(changes):
+            change_type = str(change.get("change_type", ""))
+            label = CHANGE_TYPE_LABELS.get(change_type, change_type)
+            if change_type == "price_changed":
+                detail = f"{label}：{change.get('old_value', '')} → {change.get('new_value', '')}"
+            else:
+                detail = label
+            title = str(change.get("property_title") or "（物件已刪除）")
+            values = [change.get("detected_at", ""), title, detail]
             for column_index, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                if column_index in (2, 3, 4, 6):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                self.source_table.setItem(row_index, column_index, item)
-            if source.get("id") == selected_id:
-                selected_row = row_index
-        self.source_table.resizeColumnsToContents()
-        self.source_table.setColumnWidth(0, 180)
-        if selected_row >= 0:
-            self.source_table.selectRow(selected_row)
-        elif self.sources:
-            self.source_table.selectRow(0)
+                item = QTableWidgetItem(str(value or ""))
+                self.changes_table.setItem(row_index, column_index, item)
+        self.changes_table.resizeColumnsToContents()
 
     def _refresh_history(self) -> None:
         runs = self.db.list_sync_runs(limit=50)
@@ -297,7 +529,7 @@ class SyncCenterPage(QWidget):
             values = [
                 run.get("started_at", ""),
                 run.get("source_name", ""),
-                STATUS_LABELS.get(run.get("status", ""), run.get("status", "")),
+                RUN_STATUS_LABELS.get(run.get("status", ""), run.get("status", "")),
                 run.get("found_count", 0),
                 run.get("new_count", 0),
                 run.get("updated_count", 0),
@@ -312,25 +544,17 @@ class SyncCenterPage(QWidget):
                 self.history_table.setItem(row_index, column_index, item)
         self.history_table.resizeColumnsToContents()
 
-    def selected_source(self) -> dict | None:
-        row_index = self.source_table.currentRow()
-        return self.sources[row_index] if 0 <= row_index < len(self.sources) else None
-
-    def selected_source_id(self) -> int | None:
-        source = self.selected_source()
-        return int(source["id"]) if source else None
-
     # ------------------------------------------------------------------
     # 來源管理
     # ------------------------------------------------------------------
 
     def add_source(self) -> None:
-        dialog = SyncSourceDialog(parent=self)
+        dialog = SyncSourceDialog(self.db, parent=self)
         if dialog.exec() != QDialog.DialogCode.Accepted or not dialog.result_data:
             return
 
         try:
-            self.db.save_sync_source(dialog.result_data)
+            new_id = self.db.save_sync_source(dialog.result_data)
         except DuplicateSyncSourceError as exc:
             confirm = QMessageBox.question(
                 self,
@@ -339,36 +563,32 @@ class SyncCenterPage(QWidget):
                 "要用剛剛輸入的名稱／設定更新它嗎？",
             )
             if confirm == QMessageBox.StandardButton.Yes:
+                new_id = exc.existing_id
                 self.db.save_sync_source(dialog.result_data, source_id=exc.existing_id)
             else:
                 return
 
         self.refresh()
+        show_toast(self, "✓ 已新增同步來源", kind="success")
+        if dialog.sync_now:
+            source = self.db.get_sync_source(new_id)
+            if source:
+                self.sync_source(source)
 
-    def edit_source(self) -> None:
-        source = self.selected_source()
-        if not source:
-            QMessageBox.information(self, "尚未選擇來源", "請先在列表中選擇一個同步來源。")
-            return
-        dialog = SyncSourceDialog(source=source, parent=self)
+    def edit_source(self, source: dict) -> None:
+        dialog = SyncSourceDialog(self.db, source=source, parent=self)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_data:
             self.db.save_sync_source(dialog.result_data, source_id=int(source["id"]))
             self.refresh()
+            show_toast(self, "✓ 已更新來源設定", kind="success")
 
-    def toggle_source(self) -> None:
-        source = self.selected_source()
-        if not source:
-            QMessageBox.information(self, "尚未選擇來源", "請先在列表中選擇一個同步來源。")
-            return
+    def toggle_source(self, source: dict) -> None:
         new_enabled = not bool(int(source.get("enabled", 0) or 0))
         self.db.set_sync_source_enabled(int(source["id"]), new_enabled)
         self.refresh()
+        show_toast(self, "已啟用來源" if new_enabled else "已停用來源", kind="info")
 
-    def delete_source(self) -> None:
-        source = self.selected_source()
-        if not source:
-            QMessageBox.information(self, "尚未選擇來源", "請先在列表中選擇一個同步來源。")
-            return
+    def delete_source(self, source: dict) -> None:
         confirm = QMessageBox.question(
             self,
             "確認刪除來源",
@@ -379,6 +599,7 @@ class SyncCenterPage(QWidget):
             return
         self.db.delete_sync_source(int(source["id"]))
         self.refresh()
+        show_toast(self, "已刪除來源", kind="info")
 
     def open_universal_import(self) -> None:
         dialog = UniversalImportDialog(db=self.db, on_imported=self._on_external_change, parent=self)
@@ -388,20 +609,15 @@ class SyncCenterPage(QWidget):
     # 同步執行
     # ------------------------------------------------------------------
 
-    def sync_selected_source(self) -> None:
+    def sync_source(self, source: dict) -> None:
         if self.runner is not None:
             QMessageBox.information(self, "同步進行中", "目前已有同步正在執行，請稍候。")
-            return
-        source = self.selected_source()
-        if not source:
-            QMessageBox.information(self, "尚未選擇來源", "請先新增或選擇一個同步來源。")
             return
         if not int(source.get("enabled", 0) or 0):
             QMessageBox.warning(self, "來源已停用", "請先啟用這個同步來源再執行同步。")
             return
 
         self.active_source_id = int(source["id"])
-        self.sync_now_btn.setEnabled(False)
         self.cancel_btn.setEnabled(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)
@@ -435,7 +651,7 @@ class SyncCenterPage(QWidget):
         counts = payload.get("counts", {})
         status = payload.get("status", "success")
         summary = (
-            f"同步完成（{STATUS_LABELS.get(status, status)}）："
+            f"同步完成（{RUN_STATUS_LABELS.get(status, status)}）："
             f"找到 {payload.get('found', 0)} 筆，"
             f"新增 {counts.get('new', 0)}，更新 {counts.get('updated', 0)}，"
             f"價格異動 {counts.get('price_changed', 0)}，"
@@ -443,7 +659,7 @@ class SyncCenterPage(QWidget):
         )
         self.status_label.setText(summary)
         self._finish_sync_ui()
-        QMessageBox.information(self, "同步完成", summary)
+        show_toast(self, f"✓ {summary}", kind="success", duration_ms=4000)
 
     def _on_failed(self, message: str) -> None:
         self.status_label.setText(f"同步失敗：{message}")
@@ -455,7 +671,6 @@ class SyncCenterPage(QWidget):
             self.runner.wait_and_cleanup()
         self.runner = None
         self.active_source_id = None
-        self.sync_now_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
         self.refresh()
