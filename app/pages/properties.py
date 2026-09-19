@@ -4,9 +4,11 @@ import webbrowser
 from collections.abc import Callable
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -28,6 +30,24 @@ DEFAULT_SOURCE_URL = (
     "https://shop.yungching.com.tw/"
     "034990660/list/%E4%BD%8F%E5%AE%85_p"
 )
+
+STATUS_FILTERS = ["全部", "新物件", "價格異動", "下架"]
+
+
+def _parse_wan(value: str) -> float | None:
+    import re
+
+    match = re.search(r"(\d+(?:\.\d+)?)", (value or "").replace(",", ""))
+    return float(match.group(1)) if match else None
+
+
+def _format_price_delta(old_value: str, new_value: str) -> str:
+    old_num = _parse_wan(old_value)
+    new_num = _parse_wan(new_value)
+    if old_num is None or new_num is None or old_num == new_num:
+        return "已異動"
+    arrow = "↓" if new_num < old_num else "↑"
+    return f"{arrow} {abs(old_num - new_num):g}萬"
 
 
 class PropertiesPage(QWidget):
@@ -95,6 +115,10 @@ class PropertiesPage(QWidget):
         self.favorites_only = QCheckBox("只看收藏")
         self.favorites_only.toggled.connect(self.refresh)
 
+        self.status_filter = QComboBox()
+        self.status_filter.addItems(STATUS_FILTERS)
+        self.status_filter.currentIndexChanged.connect(self.refresh)
+
         refresh_btn = QPushButton("重新整理")
         refresh_btn.setObjectName("SecondaryButton")
         refresh_btn.clicked.connect(self.refresh)
@@ -113,6 +137,8 @@ class PropertiesPage(QWidget):
 
         tools.addWidget(self.search, 1)
         tools.addWidget(self.favorites_only)
+        tools.addWidget(QLabel("篩選："))
+        tools.addWidget(self.status_filter)
         tools.addWidget(refresh_btn)
         tools.addWidget(self.favorite_btn)
         tools.addWidget(note_btn)
@@ -124,9 +150,9 @@ class PropertiesPage(QWidget):
         self.status_label.setObjectName("MutedLabel")
         root.addWidget(self.status_label)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
-            ["收藏", "ID", "物件編號", "物件名稱", "地址", "價格", "格局", "坪數", "標籤", "備註"]
+            ["收藏", "狀態", "ID", "物件編號", "物件名稱", "地址", "價格", "格局", "坪數", "標籤", "備註"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -144,34 +170,74 @@ class PropertiesPage(QWidget):
         selected = self.selected()
         if selected:
             selected_id = selected.get("id")
-        self.rows = self.db.list_properties(
+        all_rows = self.db.list_properties(
             self.search.text().strip(),
             self.favorites_only.isChecked(),
         )
+        changes_map = self.db.recent_property_changes_map()
+
+        status_filter = self.status_filter.currentText()
+        self.rows = []
+        for row in all_rows:
+            badge, kind = self._status_badge(row, changes_map)
+            if status_filter == "新物件" and badge != "🆕 新物件":
+                continue
+            if status_filter == "價格異動" and not (badge.startswith("↓") or badge.startswith("↑")):
+                continue
+            if status_filter == "下架" and row.get("status") != "offline":
+                continue
+            row = dict(row)
+            row["_badge"] = badge
+            row["_badge_kind"] = kind
+            self.rows.append(row)
+
         self.table.setRowCount(len(self.rows))
         selected_row = -1
         for row_index, row in enumerate(self.rows):
             values = [
                 "★" if int(row.get("favorite", 0) or 0) else "",
+                row.get("_badge", ""),
                 row.get("id", ""), row.get("external_id", ""), row.get("title", ""),
                 row.get("address", ""), row.get("price", ""), row.get("layout", ""),
                 row.get("size", ""), row.get("tag", ""), row.get("note", ""),
             ]
             for column_index, value in enumerate(values):
                 item = QTableWidgetItem(str(value or ""))
-                if column_index in (0, 1, 2, 5, 6, 7, 8):
+                if column_index in (0, 1, 2, 3, 6, 7, 8, 9):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if column_index == 1 and row.get("_badge_kind"):
+                    bg, fg = row["_badge_kind"]
+                    item.setBackground(QColor(bg))
+                    item.setForeground(QColor(fg))
                 self.table.setItem(row_index, column_index, item)
             if row.get("id") == selected_id:
                 selected_row = row_index
         self.table.resizeColumnsToContents()
-        self.table.setColumnWidth(3, 280)
-        self.table.setColumnWidth(4, 220)
-        self.table.setColumnWidth(9, 300)
+        self.table.setColumnWidth(4, 280)
+        self.table.setColumnWidth(5, 220)
+        self.table.setColumnWidth(10, 300)
         if selected_row >= 0:
             self.table.selectRow(selected_row)
         favorites = sum(int(row.get("favorite", 0) or 0) for row in self.rows)
         self.status_label.setText(f"目前顯示 {len(self.rows)} 筆物件，其中 {favorites} 筆收藏")
+
+    @staticmethod
+    def _status_badge(row: dict, changes_map: dict[int, dict]) -> tuple[str, tuple[str, str] | None]:
+        if row.get("status") == "offline":
+            return "已下架", ("#E5E9F0", "#526176")
+        change = changes_map.get(int(row.get("id") or 0))
+        if not change:
+            return "", None
+        change_type = change.get("change_type")
+        if change_type == "created":
+            return "🆕 新物件", ("#DBEAFE", "#1D4ED8")
+        if change_type == "price_changed":
+            return _format_price_delta(change.get("old_value", ""), change.get("new_value", "")), (
+                "#FEF3C7", "#B45309",
+            )
+        if change_type == "content_changed":
+            return "已異動", ("#DCFCE7", "#15803D")
+        return "", None
 
     def selected(self) -> dict | None:
         row_index = self.table.currentRow()
