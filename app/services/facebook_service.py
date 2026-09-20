@@ -15,6 +15,7 @@ from playwright.sync_api import (
 
 from app.services import app_paths
 from app.services.browser_runtime import verify_bundled_browser_or_raise
+from app.services.content_safety import assert_public_content_safe
 
 
 class FacebookService:
@@ -59,6 +60,8 @@ class FacebookService:
 
         if not content:
             raise ValueError("貼文內容不可空白。")
+
+        assert_public_content_safe(content)
 
         if not target_urls:
             raise ValueError("沒有設定發布位置。")
@@ -172,6 +175,10 @@ class FacebookService:
 
         if not target_urls:
             raise ValueError("沒有設定發布位置。")
+
+        # 發布前的最後一道關卡：內部工程/測試標記絕對不能出現在真正
+        # 發布到 Facebook 的公開內容裡。見 content_safety.py 的說明。
+        assert_public_content_safe(content)
 
         valid_images = self._get_valid_image_paths(
             image_paths
@@ -590,67 +597,113 @@ class FacebookService:
             "已按下發布，但無法確認貼文是否完成。"
         )
 
+    # 時間戳記文字看起來「剛剛／幾秒／幾分鐘前」的樣式——不接受「昨天」
+    # 「3 天」這種明顯不是剛剛發生的候選，避免文案剛好很像的舊貼文被
+    # 內容比對誤判成這次剛發布的那篇。
+    _RECENT_TIMESTAMP_PATTERN = re.compile(
+        r"^(剛剛|(\d+)\s*(秒|分鐘)|Just now|(\d+)\s*(sec|second|min|minute)s?)",
+        re.IGNORECASE,
+    )
+    _TIMESTAMP_LINK_NAME_PATTERN = re.compile(
+        r"\d|分鐘|小時|秒|昨天|剛剛|minute|second|hour|Yesterday|Just now",
+        re.IGNORECASE,
+    )
+    _PERMALINK_SHAPE_PATTERN = re.compile(r"/posts/|/videos/|story_fbid=|permalink\.php")
+    _POST_ID_PATTERN = re.compile(r"(?:story_fbid=|/posts/|/videos/|[?&]fbid=)(\d+)")
+
     def _capture_published_post(
         self,
         page: Page,
         content: str,
-        timeout_ms: int = 20_000,
+        timeout_ms: int = 25_000,
     ) -> dict[str, str]:
         """發布成功、貼文視窗關閉之後，嘗試從目前這個已登入的 Facebook
         session 讀取剛剛那篇貼文的 permalink，讓 AutomationEngine 可以
         真正記錄 post_url/post_id，之後才有辦法安全地自動刪文。
 
-        絕對不是「Feed 最上面那篇就是剛才發的」這種盲目假設：會先比對
-        候選貼文的可見文字是否包含這次發布內容的一段夠長、有辨識度的
-        開頭（不是只比對第一行），確認吻合才會繼續嘗試點擊貼文自己的
-        時間戳記連結取得 permalink。任何一步不確定——內容比對不到、
-        找不到時間戳記連結、連結格式不像貼文網址——就直接回傳空字典，
-        呼叫端會維持既有的安全機制（post_url 留空 -> 需要人工刪除），
-        絕對不會用猜的方式硬填一個 identifier。
+        絕對不是「Feed 最上面那篇就是剛才發的」這種盲目假設，而是要求
+        兩個條件同時成立才會採信一個候選貼文：
+        1. 內容比對——候選貼文的可見文字包含這次發布內容一段夠長、
+           有辨識度的開頭（不是只比對第一行）。
+        2. 時間交叉驗證——候選貼文自己的時間戳記文字要看起來像是
+           「剛剛／幾秒／幾分鐘前」，不是「昨天」之類明顯較舊的貼文。
 
-        這支方法本身沒有機會對真正的 Facebook 介面驗證過 selector
-        是否長期有效；如果 Facebook 改版導致找不到，會安全地回傳空字典
-        而不是拋出例外或猜測，不影響「發布成功」這個已經確認的結果。
+        兩個條件都成立才會進一步嘗試點擊該貼文自己的時間戳記連結取得
+        permalink，且連結的網址格式也要像真的貼文網址。任何一步不
+        確定——內容比對不到、時間看起來不夠新、找不到連結、連結格式
+        不像貼文網址——就直接回傳空字典，呼叫端會維持既有的安全機制
+        （post_url 留空 -> 需要人工刪除），絕對不會用猜的方式硬填一個
+        identifier。
+
+        這支方法有機會對真正的 Facebook 介面驗證過的部分，是核心比對
+        邏輯（內容比對 + 時間交叉驗證 + permalink 格式檢查）已經用
+        接近真實結構的 HTML fixture 搭配真正的 Playwright 測試過（見
+        test_post_capture_fixture.py）；但 Facebook 實際 DOM 的細節
+        selector（例如 [role='article']、時間戳記連結的確切樣式）仍然
+        沒有機會對真正的 Facebook 頁面驗證過，如果找不到會安全地回傳
+        空字典而不是拋出例外或猜測，不影響「發布成功」這個已經確認的
+        結果。
         """
-        marker = " ".join(content.strip().split())[:60]
+        marker = " ".join(content.strip().split())[:80]
         if len(marker) < 10:
             return {}
 
-        candidate: Locator | None = None
         elapsed = 0
-
         while elapsed < timeout_ms:
-            try:
-                articles = page.locator("[role='article']")
-                count = min(articles.count(), 5)
-                for index in range(count):
-                    article = articles.nth(index)
-                    try:
-                        text = " ".join(article.inner_text(timeout=1000).split())
-                    except Exception:
-                        continue
-                    if marker in text:
-                        candidate = article
-                        break
-            except Exception:
-                candidate = None
-
+            candidate = self._find_matching_recent_article(page, marker)
             if candidate is not None:
-                break
+                result = self._extract_permalink_from_article(candidate)
+                if result:
+                    return result
 
-            page.wait_for_timeout(1000)
-            elapsed += 1000
+            page.wait_for_timeout(1500)
+            elapsed += 1500
 
-        if candidate is None:
-            return {}
+        return {}
 
+    def _find_matching_recent_article(
+        self, page: Page, marker: str
+    ) -> Locator | None:
         try:
-            timestamp_link = candidate.get_by_role(
-                "link",
-                name=re.compile(
-                    r"\d|分鐘|小時|昨天|剛剛|minute|hour|Yesterday|Just now",
-                    re.IGNORECASE,
-                ),
+            articles = page.locator("[role='article']")
+            count = min(articles.count(), 10)
+        except Exception:
+            return None
+
+        for index in range(count):
+            article = articles.nth(index)
+            try:
+                text = " ".join(article.inner_text(timeout=1000).split())
+            except Exception:
+                continue
+            if marker not in text:
+                continue
+            if self._article_looks_recent(article):
+                return article
+
+        return None
+
+    def _article_looks_recent(self, article: Locator) -> bool:
+        try:
+            links = article.get_by_role("link")
+            link_count = min(links.count(), 8)
+        except Exception:
+            return False
+
+        for index in range(link_count):
+            try:
+                name = links.nth(index).inner_text(timeout=500).strip()
+            except Exception:
+                continue
+            if name and self._RECENT_TIMESTAMP_PATTERN.search(name):
+                return True
+
+        return False
+
+    def _extract_permalink_from_article(self, article: Locator) -> dict[str, str]:
+        try:
+            timestamp_link = article.get_by_role(
+                "link", name=self._TIMESTAMP_LINK_NAME_PATTERN
             ).first
             timestamp_link.wait_for(state="visible", timeout=5_000)
             href = timestamp_link.get_attribute("href")
@@ -664,11 +717,11 @@ class FacebookService:
 
         # 只接受看起來真的像單篇貼文網址的格式，避免把留言區、個人檔案
         # 連結等其他 href 誤當成 permalink。
-        if not re.search(r"/posts/|/videos/|story_fbid=|permalink\.php", post_url):
+        if not self._PERMALINK_SHAPE_PATTERN.search(post_url):
             return {}
 
         post_id = ""
-        id_match = re.search(r"(?:story_fbid=|/posts/|/videos/|[?&]fbid=)(\d+)", post_url)
+        id_match = self._POST_ID_PATTERN.search(post_url)
         if id_match:
             post_id = id_match.group(1)
 

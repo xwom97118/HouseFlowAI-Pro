@@ -26,15 +26,35 @@ def check(name: str, cond: bool) -> None:
         failures.append(name)
 
 
-def make_article_mock(text: str, href: str | None):
+def make_article_mock(text: str, href: str | None, timestamp_text: str = "剛剛"):
+    """Builds a mock [role='article'] locator whose get_by_role() branches
+    on whether a `name` filter was passed, matching the two distinct calls
+    the real _capture_published_post() makes:
+      - get_by_role("link")               -> _article_looks_recent()'s scan
+      - get_by_role("link", name=pattern) -> _extract_permalink_from_article()
+    `timestamp_text` controls what the recency scan "reads" off the link
+    (default "剛剛" = looks recent; pass something like "3 天" to simulate
+    an old post that should fail the recency cross-check).
+    """
     article = mock.MagicMock()
     article.inner_text.return_value = text
-    link = mock.MagicMock()
-    link.get_attribute.return_value = href
-    link.wait_for.return_value = None
-    role_locator = mock.MagicMock()
-    role_locator.first = link
-    article.get_by_role.return_value = role_locator
+
+    timestamp_link = mock.MagicMock()
+    timestamp_link.get_attribute.return_value = href
+    timestamp_link.wait_for.return_value = None
+    timestamp_locator = mock.MagicMock()
+    timestamp_locator.first = timestamp_link
+
+    recency_link = mock.MagicMock()
+    recency_link.inner_text.return_value = timestamp_text
+    recency_links_locator = mock.MagicMock()
+    recency_links_locator.count.return_value = 1
+    recency_links_locator.nth.side_effect = lambda i: recency_link
+
+    def get_by_role(role, name=None):
+        return timestamp_locator if name is not None else recency_links_locator
+
+    article.get_by_role.side_effect = get_by_role
     return article
 
 
@@ -80,6 +100,16 @@ check("TEST 4: non-permalink-shaped href rejected, not treated as a post URL", r
 page5 = make_page_with_articles([])
 result5 = service._capture_published_post(page5, "hi", timeout_ms=1000)
 check("TEST 5: too-short content -> refuses to even search", result5 == {})
+
+# ---- TEST 5B: content matches + valid href, but timestamp looks OLD -> recency cross-check rejects ----
+article_old = make_article_mock(
+    content,
+    "https://www.facebook.com/story.php?story_fbid=1234567890&id=999",
+    timestamp_text="3 天",
+)
+page5b = make_page_with_articles([article_old])
+result5b = service._capture_published_post(page5b, content, timeout_ms=1000)
+check("TEST 5B: content matches but timestamp is old -> rejected (recency cross-check works)", result5b == {})
 
 
 # ---- TEST 6: delete_post() safety gate -- content mismatch must abort before any delete click ----
