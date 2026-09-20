@@ -220,7 +220,9 @@ class FacebookService:
                             page
                         )
 
-                        captured = self._capture_published_post(page, content)
+                        captured = self._capture_published_post(
+                            page, content, timeout_ms=self._CAPTURE_TIMEOUT_MS
+                        )
 
                         results.append(
                             {
@@ -597,135 +599,224 @@ class FacebookService:
             "已按下發布，但無法確認貼文是否完成。"
         )
 
-    # 時間戳記文字看起來「剛剛／幾秒／幾分鐘前」的樣式——不接受「昨天」
-    # 「3 天」這種明顯不是剛剛發生的候選，避免文案剛好很像的舊貼文被
-    # 內容比對誤判成這次剛發布的那篇。
-    _RECENT_TIMESTAMP_PATTERN = re.compile(
-        r"^(剛剛|(\d+)\s*(秒|分鐘)|Just now|(\d+)\s*(sec|second|min|minute)s?)",
-        re.IGNORECASE,
+    # Poll 到最長 90 秒、每 3 秒重讀一次 DOM（2026-09-21 真實 DOM 檢查後
+    # 依使用者指示改為合理 polling，而非固定等 20 秒；找到唯一可靠候選
+    # 就立刻回傳，不會傻等到 timeout）。
+    _CAPTURE_TIMEOUT_MS = 90_000
+    _CAPTURE_POLL_INTERVAL_MS = 3_000
+
+    # 2026-09-21 對著真實登入的 Facebook 帳號（facebook_browser_profile）
+    # 做過唯讀 DOM 檢查後確認：目前繁中介面的動態消息貼文，最外層「不」
+    # 使用 role="article"（那個 selector 只會抓到空的、還在 "載入中……"
+    # 的 loading-state 佔位元素，或是展開留言時、留言本身用的容器）。
+    # 每篇貼文真正可靠的邊界是帶 aria-posinset 屬性、且內部找得到
+    # 「對＿的這則貼文採取的動作」（貼文自己的「更多選項」選單按鈕）
+    # 的那個 wrapper——這個組合同時也能排除頁面最上方限時動態列表
+    # （同樣有 aria-posinset，但沒有這顆按鈕）。
+    _PERMALINK_SHAPE_PATTERN = re.compile(
+        r"/posts/|/videos/|story_fbid=|permalink\.php|/photo(?:\.php|/)"
     )
-    _TIMESTAMP_LINK_NAME_PATTERN = re.compile(
-        r"\d|分鐘|小時|秒|昨天|剛剛|minute|second|hour|Yesterday|Just now",
-        re.IGNORECASE,
+    # 貼文永久連結的 ID 現在多半是 pfbid 開頭的英數字 token（例如
+    # .../posts/pfbid02t7umeRc7HyxPh6...），不是只有數字，所以這裡除了
+    # 舊版純數字樣式，也要接受 pfbid 樣式；抓不到 ID 不影響安全性，
+    # post_url 本身才是刪文流程實際要用的欄位。
+    _POST_ID_PATTERN = re.compile(
+        r"(?:story_fbid=|/posts/|/videos/|[?&]fbid=)(pfbid[A-Za-z0-9]+|\d+)"
     )
-    _PERMALINK_SHAPE_PATTERN = re.compile(r"/posts/|/videos/|story_fbid=|permalink\.php")
-    _POST_ID_PATTERN = re.compile(r"(?:story_fbid=|/posts/|/videos/|[?&]fbid=)(\d+)")
+
+    _OWN_NAME_FROM_COMPOSER_JS = r"""
+        () => {
+            const re = /^(.+?)，在想些什麼？$/;
+            const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+            let node;
+            while ((node = walker.nextNode())) {
+                const txt = (node.textContent || '').trim();
+                const m = txt.match(re);
+                if (m) return m[1];
+            }
+            return null;
+        }
+    """
+
+    # 掃描目前 DOM 裡所有「看起來像真正貼文」的 aria-posinset wrapper，
+    # 回傳每篇的：作者（從更多選項按鈕的 aria-label 解析）、內容是否
+    # 比對到 marker、以及所有「非留言」時間戳記連結（可見文字符合
+    # 剛剛／N秒／N分鐘／N小時／N天／昨天樣式，且其 permalink 形狀的
+    # href）。留言自己的時間戳記會被包在 role="article" 且 aria-label
+    # 是「＿的留言＿前」樣式的容器裡，這裡會排除掉，避免誤把留言的
+    # permalink 當成貼文本身的。
+    _SCAN_CANDIDATES_JS = r"""
+        (marker) => {
+            const AUTHOR_RE = /^對(.+)的這則貼文採取的動作$/;
+            const COMPACT_TIME_RE = /^(剛剛|(\d+)\s*(秒|分鐘|小時|天|週)|昨天)$/;
+            const RECENT_RE = /^(剛剛|(\d+)\s*(秒|分鐘|小時))/;
+
+            function isInsideComment(el) {
+                let cur = el;
+                let hops = 0;
+                while (cur && hops < 12) {
+                    if (cur.getAttribute && cur.getAttribute('role') === 'article') {
+                        const label = cur.getAttribute('aria-label') || '';
+                        if (label.includes('的留言')) return true;
+                    }
+                    cur = cur.parentElement;
+                    hops += 1;
+                }
+                return false;
+            }
+
+            const wrappers = Array.from(document.querySelectorAll('[aria-posinset]'));
+            const results = [];
+
+            for (const wrapper of wrappers) {
+                const moreBtn = wrapper.querySelector('[aria-label*="這則貼文採取的動作"]');
+                if (!moreBtn) continue;
+
+                const moreLabel = moreBtn.getAttribute('aria-label') || '';
+                const authorMatch = moreLabel.match(AUTHOR_RE);
+                const author = authorMatch ? authorMatch[1] : null;
+
+                const wrapperText = (wrapper.innerText || '').replace(/\s+/g, ' ').trim();
+                const contentMatch = wrapperText.includes(marker);
+
+                const shortTextEls = Array.from(wrapper.querySelectorAll('*')).filter(el => {
+                    if (el.children.length !== 0) return false;
+                    const txt = (el.textContent || '').trim();
+                    return txt.length > 0 && txt.length <= 6 && COMPACT_TIME_RE.test(txt);
+                });
+
+                const timeCandidates = [];
+                for (const t of shortTextEls) {
+                    if (isInsideComment(t)) continue;
+                    const compactText = t.textContent.trim();
+                    let clickable = t;
+                    let hops = 0;
+                    while (clickable && hops < 8) {
+                        if (clickable.tagName === 'A' || clickable.getAttribute('role') === 'link') break;
+                        clickable = clickable.parentElement;
+                        hops += 1;
+                    }
+                    if (!clickable || (clickable.tagName !== 'A' && clickable.getAttribute('role') !== 'link')) continue;
+                    const href = clickable.getAttribute('href');
+                    if (!href) continue;
+                    timeCandidates.push({
+                        compactText,
+                        isRecent: RECENT_RE.test(compactText),
+                        href,
+                        ariaLabel: clickable.getAttribute('aria-label') || '',
+                    });
+                }
+
+                results.push({
+                    ariaPosinset: wrapper.getAttribute('aria-posinset'),
+                    author,
+                    contentMatch,
+                    timeCandidates,
+                });
+            }
+
+            return results;
+        }
+    """
 
     def _capture_published_post(
         self,
         page: Page,
         content: str,
-        timeout_ms: int = 25_000,
+        timeout_ms: int | None = None,
     ) -> dict[str, str]:
         """發布成功、貼文視窗關閉之後，嘗試從目前這個已登入的 Facebook
         session 讀取剛剛那篇貼文的 permalink，讓 AutomationEngine 可以
         真正記錄 post_url/post_id，之後才有辦法安全地自動刪文。
 
-        絕對不是「Feed 最上面那篇就是剛才發的」這種盲目假設，而是要求
-        兩個條件同時成立才會採信一個候選貼文：
+        絕對不是「Feed 最上面那篇就是剛才發的」這種盲目假設，而是每一輪
+        polling 都要求同時成立：
         1. 內容比對——候選貼文的可見文字包含這次發布內容一段夠長、
-           有辨識度的開頭（不是只比對第一行）。
-        2. 時間交叉驗證——候選貼文自己的時間戳記文字要看起來像是
-           「剛剛／幾秒／幾分鐘前」，不是「昨天」之類明顯較舊的貼文。
+           有辨識度的開頭。
+        2. 時間交叉驗證——候選貼文自己（不是留言）的時間戳記文字要
+           看起來像是「剛剛／幾秒／幾分鐘／幾小時」，不是「幾天」
+           「昨天」之類明顯較舊的貼文。
+        3. permalink 格式驗證——時間戳記連結的 href 要像真的貼文／
+           相片永久連結。
+        4. 作者交叉驗證（附加訊號，非必要條件）——如果讀得到目前登入
+           帳號的真實顯示名稱，且這篇候選貼文的作者跟它不同，就直接
+           排除這個候選；讀不到就不套用這一條，不影響前三條的判定。
 
-        兩個條件都成立才會進一步嘗試點擊該貼文自己的時間戳記連結取得
-        permalink，且連結的網址格式也要像真的貼文網址。任何一步不
-        確定——內容比對不到、時間看起來不夠新、找不到連結、連結格式
-        不像貼文網址——就直接回傳空字典，呼叫端會維持既有的安全機制
-        （post_url 留空 -> 需要人工刪除），絕對不會用猜的方式硬填一個
-        identifier。
+        任何一步不確定、或同時有超過一篇候選都通過驗證（無法唯一判定
+        是哪一篇）——就直接回傳空字典，呼叫端維持既有安全機制（post_url
+        留空 -> 需要人工刪除），絕對不會用猜的方式硬填一個 identifier。
 
-        這支方法有機會對真正的 Facebook 介面驗證過的部分，是核心比對
-        邏輯（內容比對 + 時間交叉驗證 + permalink 格式檢查）已經用
-        接近真實結構的 HTML fixture 搭配真正的 Playwright 測試過（見
-        test_post_capture_fixture.py）；但 Facebook 實際 DOM 的細節
-        selector（例如 [role='article']、時間戳記連結的確切樣式）仍然
-        沒有機會對真正的 Facebook 頁面驗證過，如果找不到會安全地回傳
-        空字典而不是拋出例外或猜測，不影響「發布成功」這個已經確認的
-        結果。
+        2026-09-21 對著真實登入的帳號做過唯讀 DOM 檢查，確認了這裡用的
+        selector（aria-posinset 容器邊界、更多選項按鈕的作者名稱、
+        /posts/pfbid... 永久連結樣式）都是目前繁中介面實際存在的結構，
+        取代了先前那版完全建立在 role="article"（實際上抓不到任何貼文
+        內容）之上的舊邏輯。無法 100% 確認的部分（例如貼文自己的時間
+        戳記連結是否在每一種貼文版型下都用完全一樣的方式呈現）仍然
+        沒有絕對把握，找不到符合條件的唯一候選時一律回傳空字典。
         """
+        effective_timeout_ms = timeout_ms if timeout_ms is not None else self._CAPTURE_TIMEOUT_MS
+
         marker = " ".join(content.strip().split())[:80]
         if len(marker) < 10:
             return {}
 
-        elapsed = 0
-        while elapsed < timeout_ms:
-            candidate = self._find_matching_recent_article(page, marker)
-            if candidate is not None:
-                result = self._extract_permalink_from_article(candidate)
-                if result:
-                    return result
+        try:
+            own_name = page.evaluate(self._OWN_NAME_FROM_COMPOSER_JS)
+        except Exception:
+            own_name = None
 
-            page.wait_for_timeout(1500)
-            elapsed += 1500
+        elapsed = 0
+        while elapsed < effective_timeout_ms:
+            result = self._scan_and_extract(page, marker, own_name)
+            if result:
+                return result
+
+            page.wait_for_timeout(self._CAPTURE_POLL_INTERVAL_MS)
+            elapsed += self._CAPTURE_POLL_INTERVAL_MS
 
         return {}
 
-    def _find_matching_recent_article(
-        self, page: Page, marker: str
-    ) -> Locator | None:
+    def _scan_and_extract(
+        self, page: Page, marker: str, own_name: str | None
+    ) -> dict[str, str]:
         try:
-            articles = page.locator("[role='article']")
-            count = min(articles.count(), 10)
-        except Exception:
-            return None
-
-        for index in range(count):
-            article = articles.nth(index)
-            try:
-                text = " ".join(article.inner_text(timeout=1000).split())
-            except Exception:
-                continue
-            if marker not in text:
-                continue
-            if self._article_looks_recent(article):
-                return article
-
-        return None
-
-    def _article_looks_recent(self, article: Locator) -> bool:
-        try:
-            links = article.get_by_role("link")
-            link_count = min(links.count(), 8)
-        except Exception:
-            return False
-
-        for index in range(link_count):
-            try:
-                name = links.nth(index).inner_text(timeout=500).strip()
-            except Exception:
-                continue
-            if name and self._RECENT_TIMESTAMP_PATTERN.search(name):
-                return True
-
-        return False
-
-    def _extract_permalink_from_article(self, article: Locator) -> dict[str, str]:
-        try:
-            timestamp_link = article.get_by_role(
-                "link", name=self._TIMESTAMP_LINK_NAME_PATTERN
-            ).first
-            timestamp_link.wait_for(state="visible", timeout=5_000)
-            href = timestamp_link.get_attribute("href")
+            candidates = page.evaluate(self._SCAN_CANDIDATES_JS, marker)
         except Exception:
             return {}
 
-        if not href:
-            return {}
+        strong_matches: list[dict[str, str]] = []
 
-        post_url = href if href.startswith("http") else f"https://www.facebook.com{href}"
+        for candidate in candidates or []:
+            if not candidate.get("contentMatch"):
+                continue
+            author = candidate.get("author")
+            if own_name and author and author != own_name:
+                continue
 
-        # 只接受看起來真的像單篇貼文網址的格式，避免把留言區、個人檔案
-        # 連結等其他 href 誤當成 permalink。
-        if not self._PERMALINK_SHAPE_PATTERN.search(post_url):
-            return {}
+            for time_candidate in candidate.get("timeCandidates") or []:
+                if not time_candidate.get("isRecent"):
+                    continue
+                href = time_candidate.get("href") or ""
+                if not href:
+                    continue
+                post_url = href if href.startswith("http") else f"https://www.facebook.com{href}"
+                if not self._PERMALINK_SHAPE_PATTERN.search(post_url):
+                    continue
 
-        post_id = ""
-        id_match = self._POST_ID_PATTERN.search(post_url)
-        if id_match:
-            post_id = id_match.group(1)
+                post_id = ""
+                id_match = self._POST_ID_PATTERN.search(post_url)
+                if id_match:
+                    post_id = id_match.group(1)
 
-        return {"post_url": post_url, "post_id": post_id}
+                strong_matches.append({"post_url": post_url, "post_id": post_id})
+
+        # 同一輪掃描裡只要出現一個以上不同的候選 permalink，代表無法
+        # 唯一判定是哪一篇，安全起見一律不採信、回傳空字典。
+        unique_urls = {m["post_url"] for m in strong_matches}
+        if len(unique_urls) == 1:
+            return strong_matches[0]
+
+        return {}
 
     def _raise_if_blocked(
         self,

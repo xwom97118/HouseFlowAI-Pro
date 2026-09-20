@@ -2,10 +2,21 @@
 auto-delete can finally target a verified post instead of always falling
 back to manual_required.
 
+2026-09-21: rewritten after a real, read-only DOM inspection against the
+user's actual logged-in Facebook account (facebook_browser_profile)
+showed the previous implementation's core assumption (role="article"
+identifies a feed post) was wrong -- that selector only matches empty
+loading-state placeholders and, separately, nested COMMENT containers,
+never real top-level posts. _capture_published_post() now scans
+[aria-posinset] wrappers via a single page.evaluate() call, so these
+tests mock page.evaluate()'s return value directly instead of chaining
+Locator mocks.
+
 Covers the explicit safety requirements: never guess, verify posted
-content before trusting a candidate post, never fabricate a post_id, and
-delete_post() must refuse to proceed if the loaded page's content doesn't
-match what's expected -- no "newest post = ours" shortcuts anywhere.
+content + recency + permalink shape before trusting a candidate, cross-
+check authorship when the logged-in account's name is known, refuse when
+multiple candidates match, and delete_post() must refuse to proceed if
+the loaded page's content doesn't match what's expected.
 
 Direct execution: python test_post_capture.py
 """
@@ -26,101 +37,113 @@ def check(name: str, cond: bool) -> None:
         failures.append(name)
 
 
-def make_article_mock(text: str, href: str | None, timestamp_text: str = "剛剛"):
-    """Builds a mock [role='article'] locator whose get_by_role() branches
-    on whether a `name` filter was passed, matching the two distinct calls
-    the real _capture_published_post() makes:
-      - get_by_role("link")               -> _article_looks_recent()'s scan
-      - get_by_role("link", name=pattern) -> _extract_permalink_from_article()
-    `timestamp_text` controls what the recency scan "reads" off the link
-    (default "剛剛" = looks recent; pass something like "3 天" to simulate
-    an old post that should fail the recency cross-check).
-    """
-    article = mock.MagicMock()
-    article.inner_text.return_value = text
-
-    timestamp_link = mock.MagicMock()
-    timestamp_link.get_attribute.return_value = href
-    timestamp_link.wait_for.return_value = None
-    timestamp_locator = mock.MagicMock()
-    timestamp_locator.first = timestamp_link
-
-    recency_link = mock.MagicMock()
-    recency_link.inner_text.return_value = timestamp_text
-    recency_links_locator = mock.MagicMock()
-    recency_links_locator.count.return_value = 1
-    recency_links_locator.nth.side_effect = lambda i: recency_link
-
-    def get_by_role(role, name=None):
-        return timestamp_locator if name is not None else recency_links_locator
-
-    article.get_by_role.side_effect = get_by_role
-    return article
-
-
-def make_page_with_articles(article_mocks: list):
+def make_page(candidates: list[dict], own_name: str | None = None):
+    """page.evaluate() 是 _capture_published_post() 唯一會呼叫的
+    Playwright API：第一次呼叫回傳目前登入帳號名稱（給作者交叉驗證
+    用），之後每一輪 polling 都回傳這一輪掃到的候選貼文清單。"""
     page = mock.MagicMock()
-    articles_locator = mock.MagicMock()
-    articles_locator.count.return_value = len(article_mocks)
-    articles_locator.nth.side_effect = lambda i: article_mocks[i]
-    page.locator.return_value = articles_locator
+    call_results = [own_name, *([candidates] * 5)]
+    page.evaluate.side_effect = lambda *_args, **_kwargs: call_results.pop(0) if call_results else candidates
     page.wait_for_timeout.return_value = None
     return page
+
+
+def candidate(
+    content_match: bool = True,
+    author: str | None = "黃冠嘉",
+    href: str = "https://www.facebook.com/wang.siou.cin/posts/pfbid02t7umeRc7HyxPh6q3uZP2Mrb9dzGi6R9nrkugMvQoiUzKgZA98JzGHGbNR9zbD5j9l",
+    is_recent: bool = True,
+) -> dict:
+    return {
+        "ariaPosinset": "1",
+        "author": author,
+        "contentMatch": content_match,
+        "timeCandidates": [
+            {
+                "compactText": "剛剛",
+                "isRecent": is_recent,
+                "href": href,
+                "ariaLabel": "2026年9月21日 星期一下午3:00",
+            }
+        ]
+        if href
+        else [],
+    }
 
 
 service = FacebookService.__new__(FacebookService)  # skip __init__ (just resolves profile dir)
 content = "【HouseFlow 自動排程測試】\n\n這是一段測試用的貼文內容，足夠長，可以拿來做內容比對驗證用途。"
 
-# ---- TEST 1: content matches, valid permalink href -> captured correctly ----
-article = make_article_mock(content, "https://www.facebook.com/story.php?story_fbid=1234567890&id=999")
-page = make_page_with_articles([article])
+# ---- TEST 1: content matches, recent, valid /posts/pfbid... permalink -> captured correctly ----
+page = make_page([candidate()], own_name="黃冠嘉")
 result = service._capture_published_post(page, content, timeout_ms=1000)
-check("TEST 1: matching content + valid href -> post_url captured", result.get("post_url", "").startswith("https://www.facebook.com/story.php"))
-check("TEST 1: post_id extracted from story_fbid", result.get("post_id") == "1234567890")
+check(
+    "TEST 1: matching content + recent + valid href -> post_url captured",
+    result.get("post_url", "").startswith("https://www.facebook.com/wang.siou.cin/posts/"),
+)
+check("TEST 1: pfbid post_id extracted (alphanumeric, not just digits)", result.get("post_id") == "pfbid02t7umeRc7HyxPh6q3uZP2Mrb9dzGi6R9nrkugMvQoiUzKgZA98JzGHGbNR9zbD5j9l")
 
-# ---- TEST 2: no article matches content -> safety gate, empty dict (never guess) ----
-article_wrong = make_article_mock("完全不相關的貼文內容", "https://www.facebook.com/story.php?story_fbid=999&id=1")
-page2 = make_page_with_articles([article_wrong])
+# ---- TEST 2: no candidate's content matches -> safety gate, empty dict (never guess) ----
+page2 = make_page([candidate(content_match=False)], own_name="黃冠嘉")
 result2 = service._capture_published_post(page2, content, timeout_ms=1000)
 check("TEST 2: no content match -> returns empty (does not guess)", result2 == {})
 
-# ---- TEST 3: content matches but no timestamp link found -> empty dict ----
-article3 = make_article_mock(content, None)
-page3 = make_page_with_articles([article3])
+# ---- TEST 3: content matches but no recent timestamp link found -> empty dict ----
+page3 = make_page([candidate(href="")], own_name="黃冠嘉")
 result3 = service._capture_published_post(page3, content, timeout_ms=1000)
-check("TEST 3: content matches but href missing -> returns empty", result3 == {})
+check("TEST 3: content matches but no timestamp/href candidate -> returns empty", result3 == {})
 
-# ---- TEST 4: href found but doesn't look like a real post permalink -> rejected ----
-article4 = make_article_mock(content, "https://www.facebook.com/profile.php?id=12345")
-page4 = make_page_with_articles([article4])
+# ---- TEST 4: href found but doesn't look like a real permalink -> rejected ----
+page4 = make_page(
+    [candidate(href="https://www.facebook.com/profile.php?id=12345")], own_name="黃冠嘉"
+)
 result4 = service._capture_published_post(page4, content, timeout_ms=1000)
 check("TEST 4: non-permalink-shaped href rejected, not treated as a post URL", result4 == {})
 
 # ---- TEST 5: too-short/empty content marker -> refuses immediately (never match on nothing) ----
-page5 = make_page_with_articles([])
+page5 = make_page([], own_name="黃冠嘉")
 result5 = service._capture_published_post(page5, "hi", timeout_ms=1000)
 check("TEST 5: too-short content -> refuses to even search", result5 == {})
 
-# ---- TEST 5B: content matches + valid href, but timestamp looks OLD -> recency cross-check rejects ----
-article_old = make_article_mock(
-    content,
-    "https://www.facebook.com/story.php?story_fbid=1234567890&id=999",
-    timestamp_text="3 天",
+# ---- TEST 6: content matches + valid href, but timestamp is NOT recent (e.g. "3 天") -> rejected ----
+page6 = make_page([candidate(is_recent=False)], own_name="黃冠嘉")
+result6 = service._capture_published_post(page6, content, timeout_ms=1000)
+check("TEST 6: content matches but timestamp is old -> rejected (recency cross-check works)", result6 == {})
+
+# ---- TEST 7: author cross-check -- candidate authored by someone else than the logged-in
+#      account is rejected even though content/recency/permalink all look right ----
+page7 = make_page([candidate(author="別人的帳號")], own_name="黃冠嘉")
+result7 = service._capture_published_post(page7, content, timeout_ms=1000)
+check("TEST 7: author mismatch (not the logged-in account's own post) -> rejected", result7 == {})
+
+# ---- TEST 8: author unknown (own_name could not be determined) -> author check does not
+#      block an otherwise-valid candidate (fails open on this one additional signal only) ----
+page8 = make_page([candidate(author="某人")], own_name=None)
+result8 = service._capture_published_post(page8, content, timeout_ms=1000)
+check("TEST 8: unknown own account name -> author check does not block a valid candidate", bool(result8.get("post_url")))
+
+# ---- TEST 9: two distinct posts both pass -> ambiguous, refuses rather than picking one ----
+cand_a = candidate(href="https://www.facebook.com/user/posts/pfbidAAA")
+cand_b = candidate(href="https://www.facebook.com/user/posts/pfbidBBB")
+page9 = make_page([cand_a, cand_b], own_name="黃冠嘉")
+result9 = service._capture_published_post(page9, content, timeout_ms=1000)
+check("TEST 9: multiple distinct candidates -> ambiguous, refuses to guess", result9 == {})
+
+# ---- TEST 10: photo-post permalink shape (/photo/?fbid=...) also accepted ----
+page10 = make_page(
+    [candidate(href="https://www.facebook.com/photo/?fbid=29339576502295679&set=pcb.29339582195628443")],
+    own_name="黃冠嘉",
 )
-page5b = make_page_with_articles([article_old])
-result5b = service._capture_published_post(page5b, content, timeout_ms=1000)
-check("TEST 5B: content matches but timestamp is old -> rejected (recency cross-check works)", result5b == {})
+result10 = service._capture_published_post(page10, content, timeout_ms=1000)
+check("TEST 10: /photo/?fbid= permalink shape accepted", result10.get("post_id") == "29339576502295679")
 
 
-# ---- TEST 6: delete_post() safety gate -- content mismatch must abort before any delete click ----
+# ---- TEST 11: delete_post() safety gate -- content mismatch must abort before any delete click ----
 def build_fake_playwright_context(page_body_text: str):
     fake_page = mock.MagicMock()
     fake_page.inner_text.return_value = page_body_text
     fake_context = mock.MagicMock()
     fake_context.close.return_value = None
-    fake_playwright_cm = mock.MagicMock()
-    fake_playwright_cm.__enter__.return_value = mock.MagicMock()
-    fake_playwright_cm.__exit__.return_value = False
     return fake_page, fake_context
 
 
@@ -132,13 +155,13 @@ with mock.patch("app.services.facebook_service.sync_playwright") as mock_sp, \
      mock.patch("app.services.facebook_service.verify_bundled_browser_or_raise", return_value=None):
     mock_sp.return_value.__enter__.return_value = mock.MagicMock()
     mock_sp.return_value.__exit__.return_value = False
-    result6 = service.delete_post(
+    result11 = service.delete_post(
         "https://www.facebook.com/story.php?story_fbid=1&id=2",
         expected_content_prefix="【HouseFlow 自動排程測試】這是本來要刪除的那篇貼文開頭",
     )
-check("TEST 6: content mismatch on delete target -> refuses, success=False", result6.get("success") is False)
-check("TEST 6: refusal message names the safety reason", "刪錯" in result6.get("message", "") or "不符" in result6.get("message", ""))
-check("TEST 6: menu button was never touched (delete never attempted)", not fake_page.get_by_role.called)
+check("TEST 11: content mismatch on delete target -> refuses, success=False", result11.get("success") is False)
+check("TEST 11: refusal message names the safety reason", "刪錯" in result11.get("message", "") or "不符" in result11.get("message", ""))
+check("TEST 11: menu button was never touched (delete never attempted)", not fake_page.get_by_role.called)
 
 
 print()
