@@ -44,6 +44,10 @@ DELETE_RETRY_BACKOFF_MINUTES = (5, 30, 120)
 
 STALE_PUBLISHING_MINUTES = 10
 
+# 同步比發文更容易花較長時間（大型店頭 + 圖片下載），給比 schedules
+# 更寬鬆一點的 stale 判斷window，避免把真的還在跑的同步誤判成卡住。
+STALE_SYNCING_MINUTES = 15
+
 
 def classify_failure(message: str) -> str:
     """回傳 'login_required' / 'needs_review' / 'failed' 三種之一。"""
@@ -123,11 +127,16 @@ class AutomationCycleWorker(QObject):
             "sync_new": 0,
             "sync_price_changed": 0,
             "sync_offline": 0,
+            "sync_recovered": 0,
         }
 
         try:
             log_heartbeat("cycle starting")
             self._recover_stale(summary)
+            # sync 的 crash recovery 跟 sync_phase_enabled（開機防暴衝延遲）
+            # 無關——釋放一個卡住的 claim 純粹是 DB 清理，不會打任何網路
+            # request，沒有理由等 20 秒。
+            self._recover_stale_syncing(summary)
             login_blocked = self._process_publishes(summary)
             if not login_blocked:
                 self._process_deletes(summary)
@@ -309,6 +318,26 @@ class AutomationCycleWorker(QObject):
                     "delete_retry_scheduled",
                     f"schedule_id={schedule_id} attempt={attempt_number} 等待 {backoff_minutes} 分鐘",
                 )
+
+    def _recover_stale_syncing(self, summary: dict[str, Any]) -> None:
+        """2026-09-19 事故的直接教訓：HouseFlow 在同步中途被 crash/
+        taskkill/關機/斷電中斷時，sync_sources.sync_status='syncing' 的
+        atomic claim 沒有機會釋放，會永久卡住、之後再也不會被
+        list_due_sync_sources() 撿到。這裡在每個 cycle 開始時檢查，只
+        處理真的卡超過 STALE_SYNCING_MINUTES 的來源——還在合理時間內的
+        （真的在正常同步中）完全不會被動到，避免把還在跑的同步誤判成
+        卡住而重新啟動第二次。
+        """
+        stale = self.db.list_stale_syncing_sources(STALE_SYNCING_MINUTES)
+        for row in stale:
+            source_id = int(row["id"])
+            self.db.recover_stale_sync_source(source_id)
+            summary["sync_recovered"] = summary.get("sync_recovered", 0) + 1
+            log_event(
+                "sync_recovery",
+                f"source_id={source_id} 卡在 syncing 超過 {STALE_SYNCING_MINUTES} 分鐘，"
+                "已釋放並將對應 sync_run 標記 cancelled",
+            )
 
     def _process_due_sync_sources(self, summary: dict[str, Any]) -> None:
         """跟發文/刪文用一樣的「查 due → atomic claim → 執行 → 分類結果」

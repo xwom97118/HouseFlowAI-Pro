@@ -317,6 +317,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             "next_retry_at": "TEXT NOT NULL DEFAULT ''",
             "sync_success_count": "INTEGER NOT NULL DEFAULT 0",
             "sync_failure_count": "INTEGER NOT NULL DEFAULT 0",
+            "syncing_started_at": "TEXT NOT NULL DEFAULT ''",
         }
         for column, definition in additions.items():
             if column not in existing:
@@ -922,17 +923,65 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         ——只有真的把 sync_status 從 idle 改成 syncing 的那次呼叫，rowcount
         才會是 1。手動按「立即同步」跟 Automation tick 同時打到同一個來源，
         只有一邊搶得到，這是防止同一來源重複同步的核心機制。
+
+        syncing_started_at 用本機時間記錄 claim 的當下，是 stale-recovery
+        判斷「這筆同步是不是卡住太久」唯一依據的欄位——不能用 updated_at
+        （那欄位是 CURRENT_TIMESTAMP／UTC，跟這裡的本機時間基準不一致，
+        混用會讓 stale 判斷差 8 小時）。
         """
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 UPDATE sync_sources SET sync_status='syncing', execution_token=?,
-                    updated_at=CURRENT_TIMESTAMP
+                    syncing_started_at=?, updated_at=CURRENT_TIMESTAMP
                 WHERE id=? AND sync_status='idle'
                 """,
-                (execution_token, source_id),
+                (execution_token, now_local_str(), source_id),
             )
             return cur.rowcount == 1
+
+    def list_stale_syncing_sources(self, stale_minutes: int = 15) -> list[dict[str, Any]]:
+        """Crash recovery 用：找出卡在 syncing 太久的來源——代表上次 claim
+        之後，process 在同步完成前就被 crash/taskkill/關機/斷電 中斷，
+        claim 沒有機會正常釋放。用 syncing_started_at（本機時間）判斷，
+        還在合理時間內的（真的在正常同步中）不會被這裡動到，避免誤判
+        造成同一來源被啟動第二次同步。
+        """
+        threshold = local_str_plus(None, minutes=-stale_minutes)
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM sync_sources
+                WHERE sync_status='syncing' AND syncing_started_at != ''
+                  AND syncing_started_at <= ?
+                """,
+                (threshold,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def recover_stale_sync_source(self, source_id: int) -> None:
+        """對應的 orphaned sync_runs 一律標記 cancelled（不能假裝 success，
+        也不知道實際進度到哪），並釋放 claim 讓下一次 tick 可以正常重新
+        嘗試——不消耗 retry_count，因為這不是來源本身的錯。
+        """
+        now = now_local_str()
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE sync_runs SET status='cancelled', finished_at=?,
+                    error_message='Interrupted: HouseFlow terminated before sync completed.'
+                WHERE source_id=? AND status='running'
+                """,
+                (now, source_id),
+            )
+            conn.execute(
+                """
+                UPDATE sync_sources SET sync_status='idle', execution_token='',
+                    syncing_started_at='', updated_at=CURRENT_TIMESTAMP
+                WHERE id=? AND sync_status='syncing'
+                """,
+                (source_id,),
+            )
 
     def count_active_properties_for_source(self, source_id: int) -> int:
         with self.connect() as conn:
@@ -955,7 +1004,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 """
                 UPDATE sync_sources SET sync_status='idle', last_status='success', last_error='',
                     last_sync_at=?, last_success_at=?, next_sync_at=?, retry_count=0,
-                    next_retry_at='', execution_token='',
+                    next_retry_at='', execution_token='', syncing_started_at='',
                     sync_success_count=sync_success_count+1, updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
@@ -979,7 +1028,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                 """
                 UPDATE sync_sources SET sync_status='idle', last_status=?, last_error=?,
                     last_sync_at=?, next_sync_at=?, retry_count=0, next_retry_at='',
-                    execution_token='', updated_at=CURRENT_TIMESTAMP
+                    execution_token='', syncing_started_at='', updated_at=CURRENT_TIMESTAMP
                 WHERE id=?
                 """,
                 (status, error_message, now, next_sync, source_id),
@@ -1008,7 +1057,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                     """
                     UPDATE sync_sources SET sync_status='idle', last_status='needs_review',
                         last_error=?, last_sync_at=?, last_failure_at=?, next_sync_at=?,
-                        retry_count=0, next_retry_at='', execution_token='',
+                        retry_count=0, next_retry_at='', execution_token='', syncing_started_at='',
                         sync_failure_count=sync_failure_count+1, updated_at=CURRENT_TIMESTAMP
                     WHERE id=?
                     """,
@@ -1021,7 +1070,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                     """
                     UPDATE sync_sources SET sync_status='idle', last_status='failed',
                         last_error=?, last_sync_at=?, last_failure_at=?, next_sync_at=?,
-                        next_retry_at=?, retry_count=?, execution_token='',
+                        next_retry_at=?, retry_count=?, execution_token='', syncing_started_at='',
                         sync_failure_count=sync_failure_count+1, updated_at=CURRENT_TIMESTAMP
                     WHERE id=?
                     """,
