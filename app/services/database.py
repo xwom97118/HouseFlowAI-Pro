@@ -252,6 +252,12 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
             "started_at": "TEXT NOT NULL DEFAULT ''",
             "next_retry_at": "TEXT NOT NULL DEFAULT ''",
             "delete_after_days": "INTEGER",
+            # DEV ONLY：分鐘級的刪文倒數，供開發驗收測試使用（例如「發布
+            # 後 5 分鐘」），不對應任何正式 UI 選項，一般排程永遠是 NULL。
+            # delete_after_days 是整數天，天生無法表示 5 分鐘這種粒度，
+            # 所以另外開一個欄位，而不是硬塞一個會被 int() 捨去成 0 的
+            # 假天數。mark_schedule_published() 有值時優先使用這個欄位。
+            "delete_after_minutes": "INTEGER",
             "delete_at": "TEXT NOT NULL DEFAULT ''",
             "delete_status": "TEXT NOT NULL DEFAULT 'not_scheduled'",
             "delete_attempt_count": "INTEGER NOT NULL DEFAULT 0",
@@ -1374,14 +1380,18 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         images_value = data.get("images", [])
         images = images_value if isinstance(images_value, str) else "\n".join(images_value)
         delete_after_days = data.get("delete_after_days")
+        # DEV ONLY——見 _ensure_schedule_columns() 的說明，一般呼叫端不會
+        # 傳這個 key，一定是 None。
+        delete_after_minutes = data.get("delete_after_minutes")
 
         with self.connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO schedules(
                     property_id, platform, target, target_label, copy_text,
-                    images, scheduled_at, status, batch_id, delete_after_days
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    images, scheduled_at, status, batch_id, delete_after_days,
+                    delete_after_minutes
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     data.get("property_id"),
@@ -1394,6 +1404,7 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
                     str(data.get("status", "pending_review")).strip() or "pending_review",
                     str(data.get("batch_id", "")).strip(),
                     int(delete_after_days) if delete_after_days not in (None, "") else None,
+                    int(delete_after_minutes) if delete_after_minutes not in (None, "") else None,
                 ),
             )
             return int(cur.lastrowid)
@@ -1549,13 +1560,19 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         published_at = now_local_str()
         with self.connect() as conn:
             row = conn.execute(
-                "SELECT delete_after_days FROM schedules WHERE id=?", (schedule_id,)
+                "SELECT delete_after_days, delete_after_minutes FROM schedules WHERE id=?",
+                (schedule_id,),
             ).fetchone()
             delete_after_days = row["delete_after_days"] if row else None
+            delete_after_minutes = row["delete_after_minutes"] if row else None
 
             delete_at = ""
             delete_status = "not_scheduled"
-            if delete_after_days is not None:
+            if delete_after_minutes is not None:
+                # DEV ONLY 分鐘級倒數優先於天數——見 _ensure_schedule_columns()。
+                delete_at = local_str_plus(published_at, minutes=int(delete_after_minutes))
+                delete_status = "pending"
+            elif delete_after_days is not None:
                 delete_at = local_str_plus(published_at, days=int(delete_after_days))
                 delete_status = "pending"
 
