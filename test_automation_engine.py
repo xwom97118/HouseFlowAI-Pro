@@ -78,7 +78,7 @@ class MockFacebookService:
         }
         return {"results": [behavior]}
 
-    def delete_post(self, remote_post_url):
+    def delete_post(self, remote_post_url, expected_content_prefix=""):
         return MockFacebookService.queue.pop(0) if MockFacebookService.queue else {
             "success": True, "message": "deleted"
         }

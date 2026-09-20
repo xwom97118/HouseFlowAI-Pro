@@ -69,7 +69,9 @@ class SchedulePublishRunner(QObject):
             success = bool(results and results[0].get("success"))
 
             if success:
-                self.db.mark_schedule_published(schedule_id)
+                post_url = str(results[0].get("post_url", "") or "") if results else ""
+                post_id = str(results[0].get("post_id", "") or "") if results else ""
+                self.db.mark_schedule_published(schedule_id, post_url=post_url, post_id=post_id)
                 self.finished.emit(
                     {"schedule_id": schedule_id, "success": True, "message": "發布成功"}
                 )
@@ -138,7 +140,8 @@ class ScheduleDeleteRunner(QObject):
 
         try:
             facebook = FacebookService()
-            result = facebook.delete_post(post_url)
+            expected_prefix = str(self.schedule.get("copy_text", "") or "")
+            result = facebook.delete_post(post_url, expected_content_prefix=expected_prefix)
 
             if result.get("success"):
                 self.db.mark_schedule_deleted(schedule_id)

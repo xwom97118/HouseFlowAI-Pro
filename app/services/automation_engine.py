@@ -200,16 +200,19 @@ class AutomationCycleWorker(QObject):
                 )
 
             if result.get("success"):
-                # 注意：facebook_service.publish_posts() 目前不會回傳可靠
-                # 的貼文網址/ID（見 delete_post() 的說明），所以這裡不猜，
-                # post_url/post_id 留空，代表這個 target 之後無法自動刪文
-                # （只能人工刪除）。
-                self.db.mark_schedule_published(schedule_id, post_url="", post_id="")
+                # facebook_service._capture_published_post() 會在發布成功
+                # 後嘗試比對內容、讀取 permalink；比對不到或抓不到就回傳
+                # 空字串——這裡不會再另外猜，空字串一樣代表這個 target
+                # 之後無法自動刪文（只能人工刪除）。
+                post_url = str(result.get("post_url", "") or "")
+                post_id = str(result.get("post_id", "") or "")
+                self.db.mark_schedule_published(schedule_id, post_url=post_url, post_id=post_id)
                 self.db.finish_execution(execution_id, "success")
                 summary["published"] += 1
-                # post_url/post_id 目前永遠是空字串（見上方註解），記錄下來
-                # 是刻意的——之後補上可靠識別方式時，這行 log 格式不用改。
-                log_event("publish_success", f"schedule_id={schedule_id} post_url= post_id=")
+                log_event(
+                    "publish_success",
+                    f"schedule_id={schedule_id} post_url={post_url} post_id={post_id}",
+                )
                 continue
 
             message = str(result.get("message", "") or "未知錯誤")
@@ -282,7 +285,8 @@ class AutomationCycleWorker(QObject):
 
             try:
                 facebook = self.facebook_factory()
-                result = facebook.delete_post(remote_post_url)
+                expected_prefix = str(row.get("copy_text", "") or "")
+                result = facebook.delete_post(remote_post_url, expected_content_prefix=expected_prefix)
             except Exception as exc:
                 result = {"success": False, "message": str(exc)}
 

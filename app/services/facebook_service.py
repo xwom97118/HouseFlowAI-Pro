@@ -213,11 +213,15 @@ class FacebookService:
                             page
                         )
 
+                        captured = self._capture_published_post(page, content)
+
                         results.append(
                             {
                                 "url": target_url,
                                 "success": True,
                                 "message": "發布完成",
+                                "post_url": captured.get("post_url", ""),
+                                "post_id": captured.get("post_id", ""),
                             }
                         )
 
@@ -255,17 +259,18 @@ class FacebookService:
             "results": results,
         }
 
-    def delete_post(self, remote_post_url: str) -> dict[str, Any]:
+    def delete_post(
+        self, remote_post_url: str, expected_content_prefix: str = ""
+    ) -> dict[str, Any]:
         """刪除一篇 HouseFlow 自己發布、且已經有可靠 remote_post_url 的
         貼文。呼叫端（AutomationEngine）必須先確認這個 URL 存在且可靠
         才能呼叫這裡 —— 這個方法本身不做任何「用文案/物件名稱/時間找
         貼文」之類的猜測性比對，只會直接開啟這個貼文自己的網址操作。
 
-        目前沒有任何發布流程會回傳可靠的 remote_post_url（見
-        publish_posts() 的說明），所以這個方法目前實際上不會被正式
-        呼叫到；先建好架構與安全介面，selector 是參考現有
-        _click_publish 等方法推測的合理操作流程，還沒有機會對真正的
-        Facebook 介面驗證過，正式使用前需要真人在允許的範圍內測試。
+        如果呼叫端有提供 expected_content_prefix（該筆 schedule 自己的
+        文案開頭），會先確認 permalink 頁面實際顯示的內容真的包含這段
+        文字才會繼續操作——避免 permalink 失效／被導向錯誤內容時，
+        誤刪到不是本來要刪的貼文。比對不到就直接安全失敗，不會強行刪除。
 
         回傳：{"success": bool, "message": str}
         """
@@ -285,6 +290,20 @@ class FacebookService:
                 page.wait_for_timeout(2000)
 
                 self._raise_if_blocked(page)
+
+                if expected_content_prefix:
+                    marker = " ".join(expected_content_prefix.strip().split())[:60]
+                    if marker:
+                        try:
+                            page_text = " ".join(page.inner_text("body", timeout=5_000).split())
+                        except Exception:
+                            page_text = ""
+                        if marker not in page_text:
+                            return {
+                                "success": False,
+                                "message": "安全檢查失敗：這個網址目前顯示的內容跟預期的貼文不符，"
+                                "為避免刪錯貼文已中止操作。",
+                            }
 
                 menu_button = page.get_by_role(
                     "button",
@@ -570,6 +589,90 @@ class FacebookService:
         raise RuntimeError(
             "已按下發布，但無法確認貼文是否完成。"
         )
+
+    def _capture_published_post(
+        self,
+        page: Page,
+        content: str,
+        timeout_ms: int = 20_000,
+    ) -> dict[str, str]:
+        """發布成功、貼文視窗關閉之後，嘗試從目前這個已登入的 Facebook
+        session 讀取剛剛那篇貼文的 permalink，讓 AutomationEngine 可以
+        真正記錄 post_url/post_id，之後才有辦法安全地自動刪文。
+
+        絕對不是「Feed 最上面那篇就是剛才發的」這種盲目假設：會先比對
+        候選貼文的可見文字是否包含這次發布內容的一段夠長、有辨識度的
+        開頭（不是只比對第一行），確認吻合才會繼續嘗試點擊貼文自己的
+        時間戳記連結取得 permalink。任何一步不確定——內容比對不到、
+        找不到時間戳記連結、連結格式不像貼文網址——就直接回傳空字典，
+        呼叫端會維持既有的安全機制（post_url 留空 -> 需要人工刪除），
+        絕對不會用猜的方式硬填一個 identifier。
+
+        這支方法本身沒有機會對真正的 Facebook 介面驗證過 selector
+        是否長期有效；如果 Facebook 改版導致找不到，會安全地回傳空字典
+        而不是拋出例外或猜測，不影響「發布成功」這個已經確認的結果。
+        """
+        marker = " ".join(content.strip().split())[:60]
+        if len(marker) < 10:
+            return {}
+
+        candidate: Locator | None = None
+        elapsed = 0
+
+        while elapsed < timeout_ms:
+            try:
+                articles = page.locator("[role='article']")
+                count = min(articles.count(), 5)
+                for index in range(count):
+                    article = articles.nth(index)
+                    try:
+                        text = " ".join(article.inner_text(timeout=1000).split())
+                    except Exception:
+                        continue
+                    if marker in text:
+                        candidate = article
+                        break
+            except Exception:
+                candidate = None
+
+            if candidate is not None:
+                break
+
+            page.wait_for_timeout(1000)
+            elapsed += 1000
+
+        if candidate is None:
+            return {}
+
+        try:
+            timestamp_link = candidate.get_by_role(
+                "link",
+                name=re.compile(
+                    r"\d|分鐘|小時|昨天|剛剛|minute|hour|Yesterday|Just now",
+                    re.IGNORECASE,
+                ),
+            ).first
+            timestamp_link.wait_for(state="visible", timeout=5_000)
+            href = timestamp_link.get_attribute("href")
+        except Exception:
+            return {}
+
+        if not href:
+            return {}
+
+        post_url = href if href.startswith("http") else f"https://www.facebook.com{href}"
+
+        # 只接受看起來真的像單篇貼文網址的格式，避免把留言區、個人檔案
+        # 連結等其他 href 誤當成 permalink。
+        if not re.search(r"/posts/|/videos/|story_fbid=|permalink\.php", post_url):
+            return {}
+
+        post_id = ""
+        id_match = re.search(r"(?:story_fbid=|/posts/|/videos/|[?&]fbid=)(\d+)", post_url)
+        if id_match:
+            post_id = id_match.group(1)
+
+        return {"post_url": post_url, "post_id": post_id}
 
     def _raise_if_blocked(
         self,
