@@ -141,7 +141,12 @@ class ScheduleDeleteRunner(QObject):
         try:
             facebook = FacebookService()
             expected_prefix = str(self.schedule.get("copy_text", "") or "")
-            result = facebook.delete_post(post_url, expected_content_prefix=expected_prefix)
+            expected_post_id = str(self.schedule.get("post_id", "") or "")
+            result = facebook.delete_post(
+                post_url,
+                expected_content_prefix=expected_prefix,
+                expected_post_id=expected_post_id,
+            )
 
             if result.get("success"):
                 self.db.mark_schedule_deleted(schedule_id)

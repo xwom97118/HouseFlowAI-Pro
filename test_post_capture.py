@@ -163,30 +163,189 @@ result11 = service._capture_published_post(page11, content, timeout_ms=1000)
 check("TEST 11: multiple photo hrefs from the same post (same set=) -> not falsely ambiguous", bool(result11.get("post_url")))
 
 
-# ---- TEST 12: delete_post() safety gate -- content mismatch must abort before any delete click ----
-def build_fake_playwright_context(page_body_text: str):
+# ======================================================================
+# Shared fingerprint helper (_normalize_text / _build_fingerprint /
+# _fingerprint_matches_text) -- 2026-09-21: capture_published_post() and
+# delete_post() used to each maintain their own separate content-
+# comparison logic; delete_post()'s copy never got the emoji-stripping
+# fix, so a real schedule (id=7) that capture successfully found was
+# then rejected by delete_post()'s own safety check as "content doesn't
+# match" -- a false negative, not a real mismatch. Both now share one
+# implementation. These tests cover the required regression scenarios:
+# whitespace/newline changes, emoji, full-width/half-width punctuation,
+# footer present, a similar-but-different property (must NOT match), and
+# a completely unrelated post (must NOT match).
+# ======================================================================
+
+REAL_SCHEDULE_CONTENT = (
+    "如果你正在找龍潭區首購物件，不要只比較總價，格局、坪數與未來使用彈性也很重要。\n\n"
+    "🏠【龍潭石門雲享套房】\n💰 售價：496萬\n📍 桃園市龍潭區民有一街\n📐 1房1廳1衛｜19.85坪\n\n"
+    "如果你正在準備人生第一間房，這間可以先列入比較。\n\n"
+    "────────────────\n經紀業：洺埕開發企業社\n營業員：（108）登字第352260號\n經紀人：（113）南市字第01004號"
+)
+
+fingerprint_real = service._build_fingerprint(REAL_SCHEDULE_CONTENT)
+check("FINGERPRINT: marker built from real schedule content is non-empty", bool(fingerprint_real["marker"]))
+check("FINGERPRINT: price token extracted", fingerprint_real["price_token"] == "496萬")
+check("FINGERPRINT: title token extracted", fingerprint_real["title_token"] == "龍潭石門雲享套房")
+
+# Facebook 的 innerText 呈現：表情符號消失、換行變空白、詞語間可能被
+# DOM 拆字插入額外空白，footer 依然完整顯示。
+facebook_rendered_text = (
+    "黃冠嘉 · 1小時 如果你正在找龍潭區首購物件，不要只比較總價，格局、坪數與未來使用彈性也很重要。 "
+    "【龍潭石門雲享套房】  售價：496萬   桃園市龍潭區民有一街 1房1廳1衛｜19.85坪 "
+    "如果你正在準備人生第一間房，這間可以先列入比較。 ──────────────── "
+    "經紀業：洺埕開發企業社 營業員：（108）登字第352260號 經紀人：（113）南市字第01004號 編輯 2 留言"
+)
+check(
+    "FINGERPRINT: matches real Facebook-rendered text (whitespace/newline/emoji differences)",
+    service._fingerprint_matches_text(fingerprint_real, facebook_rendered_text),
+)
+
+# 全形／半形空白混雜，NFKC 正規化後仍要比對得到。
+fullwidth_space_text = facebook_rendered_text.replace(" ", "　", 3)
+check(
+    "FINGERPRINT: matches text with full-width spaces mixed in (NFKC normalization)",
+    service._fingerprint_matches_text(fingerprint_real, fullwidth_space_text),
+)
+
+# 相似但不同的物件（同社區、不同戶型／價格）——不應該誤判成同一篇。
+similar_but_different_text = (
+    "黃冠嘉 · 2小時 如果你正在找龍潭區首購物件，不要只比較總價，格局、坪數與未來使用彈性也很重要。 "
+    "【龍潭石門雲享套房B棟】  售價：688萬   桃園市龍潭區民有一街 2房1廳1衛｜25坪"
+)
+check(
+    "FINGERPRINT: similar-but-different property (different price/title) -> NO MATCH",
+    not service._fingerprint_matches_text(fingerprint_real, similar_but_different_text),
+)
+
+# 完全不相關的另一篇貼文。
+unrelated_text = "黃冠嘉 · 3小時 今天天氣真好，帶小孩去公園玩，大家也要多運動喔！"
+check(
+    "FINGERPRINT: completely unrelated post -> NO MATCH",
+    not service._fingerprint_matches_text(fingerprint_real, unrelated_text),
+)
+
+# 全形數字／字母（NFKC 可正規化的相容字元）不應該讓比對整個失敗。
+fullwidth_digits_text = facebook_rendered_text.replace("496萬", "４９６萬")
+check(
+    "FINGERPRINT: full-width digit variant (NFKC-normalizable) still matches",
+    service._fingerprint_matches_text(fingerprint_real, fullwidth_digits_text),
+)
+
+
+# ======================================================================
+# delete_post() multi-signal verification (URL identity + content
+# fingerprint + unique-target button scoping), using the shared
+# fingerprint helper -- 2026-09-21 rewrite.
+# ======================================================================
+
+def build_fake_page_for_delete(
+    page_url: str,
+    page_body_text: str,
+    menu_button_count: int = 1,
+    opened_menu_count: int = 1,
+):
     fake_page = mock.MagicMock()
+    fake_page.url = page_url
     fake_page.inner_text.return_value = page_body_text
+
+    def make_clickable_locator(count: int):
+        locator = mock.MagicMock()
+        locator.count.return_value = count
+        item = mock.MagicMock()
+        item.is_visible.return_value = True
+        item.click.return_value = None
+        locator.nth.return_value = item
+        return locator, item
+
+    menu_button_locator, _ = make_clickable_locator(menu_button_count)
+
+    opened_menu_locator = mock.MagicMock()
+    opened_menu_locator.count.return_value = opened_menu_count
+    opened_menu_first = mock.MagicMock()
+    opened_menu_locator.first = opened_menu_first
+
+    delete_action_locator, _ = make_clickable_locator(1)
+    opened_menu_first.get_by_role.return_value = delete_action_locator
+
+    confirm_button_locator, _ = make_clickable_locator(1)
+
+    def locator_side_effect(selector, *_a, **_k):
+        if selector == '[aria-label*="貼文採取的動作"]':
+            return menu_button_locator
+        if selector == '[role="menu"]':
+            return opened_menu_locator
+        return mock.MagicMock()
+
+    fake_page.locator.side_effect = locator_side_effect
+    fake_page.get_by_role.return_value = confirm_button_locator
+
     fake_context = mock.MagicMock()
     fake_context.close.return_value = None
     return fake_page, fake_context
 
 
-fake_page, fake_context = build_fake_playwright_context("這篇貼文的內容跟我們預期的完全不一樣")
-with mock.patch("app.services.facebook_service.sync_playwright") as mock_sp, \
-     mock.patch.object(FacebookService, "_open_context", return_value=fake_context), \
-     mock.patch.object(FacebookService, "_get_page", return_value=fake_page), \
-     mock.patch.object(FacebookService, "_raise_if_blocked", return_value=None), \
-     mock.patch("app.services.facebook_service.verify_bundled_browser_or_raise", return_value=None):
-    mock_sp.return_value.__enter__.return_value = mock.MagicMock()
-    mock_sp.return_value.__exit__.return_value = False
-    result12 = service.delete_post(
-        "https://www.facebook.com/story.php?story_fbid=1&id=2",
-        expected_content_prefix="【HouseFlow 自動排程測試】這是本來要刪除的那篇貼文開頭",
-    )
-check("TEST 12: content mismatch on delete target -> refuses, success=False", result12.get("success") is False)
-check("TEST 12: refusal message names the safety reason", "刪錯" in result12.get("message", "") or "不符" in result12.get("message", ""))
-check("TEST 12: menu button was never touched (delete never attempted)", not fake_page.get_by_role.called)
+def run_delete(fake_page, fake_context, remote_post_url, expected_content_prefix="", expected_post_id=""):
+    with mock.patch("app.services.facebook_service.sync_playwright") as mock_sp, \
+         mock.patch.object(FacebookService, "_open_context", return_value=fake_context), \
+         mock.patch.object(FacebookService, "_get_page", return_value=fake_page), \
+         mock.patch.object(FacebookService, "_raise_if_blocked", return_value=None), \
+         mock.patch("app.services.facebook_service.verify_bundled_browser_or_raise", return_value=None):
+        mock_sp.return_value.__enter__.return_value = mock.MagicMock()
+        mock_sp.return_value.__exit__.return_value = False
+        return service.delete_post(
+            remote_post_url,
+            expected_content_prefix=expected_content_prefix,
+            expected_post_id=expected_post_id,
+        )
+
+
+REAL_POST_URL = "https://www.facebook.com/photo/?fbid=28630627439864864&set=a.336927529661567"
+
+# ---- TEST D1: content mismatch (URL identity passes) -> abort before any menu click ----
+fake_page, fake_context = build_fake_page_for_delete(REAL_POST_URL, "這篇貼文的內容跟我們預期的完全不一樣")
+resultD1 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix="【HouseFlow 自動排程測試】這是本來要刪除的那篇貼文開頭")
+check("TEST D1: content mismatch on delete target -> refuses, success=False", resultD1.get("success") is False)
+check("TEST D1: refusal message names the safety reason", "刪錯" in resultD1.get("message", "") or "不符" in resultD1.get("message", ""))
+menu_selector_calls = [c.args[0] for c in fake_page.locator.call_args_list if c.args]
+check(
+    "TEST D1: menu button was never touched (delete never attempted)",
+    '[aria-label*="貼文採取的動作"]' not in menu_selector_calls,
+)
+
+# ---- TEST D2: expected_post_id given but the resolved page URL's post_id differs -> reject
+#      at the URL-identity step, even though content would otherwise match ----
+fake_page, fake_context = build_fake_page_for_delete(
+    "https://www.facebook.com/photo/?fbid=999999999&set=a.other", REAL_SCHEDULE_CONTENT
+)
+resultD2 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix=REAL_SCHEDULE_CONTENT, expected_post_id="28630627439864864")
+check("TEST D2: post_id mismatch -> refuses before content check", resultD2.get("success") is False)
+check("TEST D2: refusal message mentions post_id", "post_id" in resultD2.get("message", ""))
+
+# ---- TEST D3: no expected_post_id given; resolved URL is a different post (different
+#      normalized group key) -> reject ----
+fake_page, fake_context = build_fake_page_for_delete(
+    "https://www.facebook.com/some-other-user/posts/pfbidCompletelyDifferent", REAL_SCHEDULE_CONTENT
+)
+resultD3 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix=REAL_SCHEDULE_CONTENT)
+check("TEST D3: URL identity (no post_id) mismatch -> refuses", resultD3.get("success") is False)
+
+# ---- TEST D4: everything checks out (URL identity + content fingerprint + unique menu) ----
+fake_page, fake_context = build_fake_page_for_delete(REAL_POST_URL, REAL_SCHEDULE_CONTENT)
+resultD4 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix=REAL_SCHEDULE_CONTENT, expected_post_id="28630627439864864")
+check("TEST D4: full success path -> success=True", resultD4.get("success") is True)
+
+# ---- TEST D5: multiple candidate "post actions" buttons found -> ambiguous, refuses
+#      rather than clicking the first one on the page ----
+fake_page, fake_context = build_fake_page_for_delete(REAL_POST_URL, REAL_SCHEDULE_CONTENT, menu_button_count=2)
+resultD5 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix=REAL_SCHEDULE_CONTENT, expected_post_id="28630627439864864")
+check("TEST D5: multiple post-actions buttons -> ambiguous, refuses to guess which one", resultD5.get("success") is False)
+
+# ---- TEST D6: menu button click didn't yield exactly one open menu -> refuses ----
+fake_page, fake_context = build_fake_page_for_delete(REAL_POST_URL, REAL_SCHEDULE_CONTENT, opened_menu_count=0)
+resultD6 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix=REAL_SCHEDULE_CONTENT, expected_post_id="28630627439864864")
+check("TEST D6: no menu opened after click -> refuses rather than guessing", resultD6.get("success") is False)
 
 
 print()

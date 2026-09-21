@@ -286,7 +286,12 @@ class AutomationCycleWorker(QObject):
             try:
                 facebook = self.facebook_factory()
                 expected_prefix = str(row.get("copy_text", "") or "")
-                result = facebook.delete_post(remote_post_url, expected_content_prefix=expected_prefix)
+                expected_post_id = str(row.get("post_id", "") or "")
+                result = facebook.delete_post(
+                    remote_post_url,
+                    expected_content_prefix=expected_prefix,
+                    expected_post_id=expected_post_id,
+                )
             except Exception as exc:
                 result = {"success": False, "message": str(exc)}
 

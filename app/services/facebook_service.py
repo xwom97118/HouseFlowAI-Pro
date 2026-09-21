@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -269,17 +270,39 @@ class FacebookService:
         }
 
     def delete_post(
-        self, remote_post_url: str, expected_content_prefix: str = ""
+        self,
+        remote_post_url: str,
+        expected_content_prefix: str = "",
+        expected_post_id: str = "",
     ) -> dict[str, Any]:
         """刪除一篇 HouseFlow 自己發布、且已經有可靠 remote_post_url 的
         貼文。呼叫端（AutomationEngine）必須先確認這個 URL 存在且可靠
         才能呼叫這裡 —— 這個方法本身不做任何「用文案/物件名稱/時間找
         貼文」之類的猜測性比對，只會直接開啟這個貼文自己的網址操作。
 
-        如果呼叫端有提供 expected_content_prefix（該筆 schedule 自己的
-        文案開頭），會先確認 permalink 頁面實際顯示的內容真的包含這段
-        文字才會繼續操作——避免 permalink 失效／被導向錯誤內容時，
-        誤刪到不是本來要刪的貼文。比對不到就直接安全失敗，不會強行刪除。
+        刪除前的身分驗證（任何一項不通過就直接安全失敗，不會強行刪除）：
+        A. URL identity——導覽完成後實際落在的網址，如果呼叫端有給
+           expected_post_id 就要求解析出的 post_id 完全相符；沒有給
+           post_id 的話，退一步比較正規化後的網址（拿掉 Facebook 自己
+           加的追蹤參數）是不是同一篇貼文（見 _permalink_group_key）。
+        B. content fingerprint——如果呼叫端有提供 expected_content_prefix
+           （該筆 schedule 自己的文案），用跟 capture_published_post()
+           完全同一套規則（_build_fingerprint/_fingerprint_matches_text）
+           確認頁面實際顯示的內容真的符合，不是各自維護一份不一致的
+           比對邏輯。
+
+        2026-09-21：先前版本這裡自己另外算了一份 marker（沒有拿掉表情
+        符號），跟 capture_published_post() 修過的版本不一致，導致明明
+        capture 抓得到的貼文，delete_post() 自己的安全檢查卻誤判內容
+        不符、擋下正確的刪除操作（schedule id=7 的第一輪真實刪除測試
+        就是被這個 bug 擋下的）。這一版改成兩邊共用同一份 fingerprint
+        邏輯，不會再各自為政。
+
+        找「更多選項」按鈕時要求畫面上「剛好只有一個」符合的候選才會
+        繼續——同一次對著 /photo/ 永久連結頁面的真實診斷發現，那種
+        頁面上還會有很多其他人「留言」自己的「更多關於＿的選項」按鈕
+        （不是「貼文採取的動作」這個措辭，不會誤觸），但為了保險，
+        還是明確檢查數量剛好是 1，不是盲目挑「畫面上第一個」。
 
         回傳：{"success": bool, "message": str}
         """
@@ -300,29 +323,66 @@ class FacebookService:
 
                 self._raise_if_blocked(page)
 
+                # --- A. URL identity ---
+                actual_url = page.url
+                id_match = self._POST_ID_PATTERN.search(actual_url)
+                actual_post_id = id_match.group(1) if id_match else ""
+                if expected_post_id:
+                    if actual_post_id != expected_post_id:
+                        return {
+                            "success": False,
+                            "message": (
+                                f"安全檢查失敗：目前頁面解析出的 post_id"
+                                f"（{actual_post_id or '無法讀取'}）跟預期的"
+                                f"post_id（{expected_post_id}）不符，"
+                                "為避免刪錯貼文已中止操作。"
+                            ),
+                        }
+                elif self._permalink_group_key(actual_url) != self._permalink_group_key(remote_post_url):
+                    return {
+                        "success": False,
+                        "message": "安全檢查失敗：導覽後的網址跟預期的 post_url 不是同一篇貼文，"
+                        "為避免刪錯貼文已中止操作。",
+                    }
+
+                # --- B. content fingerprint ---
                 if expected_content_prefix:
-                    marker = " ".join(expected_content_prefix.strip().split())[:60]
-                    if marker:
+                    fingerprint = self._build_fingerprint(expected_content_prefix)
+                    if fingerprint["marker"]:
                         try:
-                            page_text = " ".join(page.inner_text("body", timeout=5_000).split())
+                            page_text = page.inner_text("body", timeout=5_000)
                         except Exception:
                             page_text = ""
-                        if marker not in page_text:
+                        if not self._fingerprint_matches_text(fingerprint, page_text):
                             return {
                                 "success": False,
                                 "message": "安全檢查失敗：這個網址目前顯示的內容跟預期的貼文不符，"
                                 "為避免刪錯貼文已中止操作。",
                             }
 
-                menu_button = page.get_by_role(
-                    "button",
-                    name=re.compile(r"動態消息選項|貼文選項|更多選項|More|Actions for this post"),
-                )
+                menu_button = page.locator('[aria-label*="貼文採取的動作"]')
+                menu_count = menu_button.count()
+                if menu_count == 0:
+                    raise RuntimeError("找不到貼文選項按鈕，無法刪除。")
+                if menu_count > 1:
+                    raise RuntimeError(
+                        f"畫面上找到 {menu_count} 個可能的貼文選項按鈕，無法唯一判定要點哪一個，"
+                        "為避免刪錯貼文已中止操作。"
+                    )
                 if not self._click_first_visible(menu_button):
                     raise RuntimeError("找不到貼文選項按鈕，無法刪除。")
                 page.wait_for_timeout(800)
 
-                delete_action = page.get_by_role(
+                opened_menus = page.locator('[role="menu"]')
+                menu_open_count = opened_menus.count()
+                if menu_open_count != 1:
+                    raise RuntimeError(
+                        f"點擊貼文選項後畫面上出現 {menu_open_count} 個選單，"
+                        "無法確認要在哪一個裡面找「刪除貼文」，已中止操作。"
+                    )
+                opened_menu = opened_menus.first
+
+                delete_action = opened_menu.get_by_role(
                     "menuitem",
                     name=re.compile(r"刪除貼文|移到垃圾桶|Delete post|Move to trash"),
                 )
@@ -665,6 +725,58 @@ class FacebookService:
     # 仍然足夠有辨識度（涵蓋不只一句話）。
     _CONTENT_MARKER_LENGTH = 60
 
+    # 2026-09-21：capture_published_post() 與 delete_post() 原本各自維護
+    # 一份自己的內容比對邏輯，兩邊不一致——delete_post() 那份沒有跟著
+    # 更新去掉表情符號，導致明明是同一篇、capture 抓得到的貼文，
+    # delete_post() 自己的安全檢查卻誤判不符，擋下了正確的刪除操作。
+    # 這裡改成兩邊共用同一套 fingerprint 邏輯，不是「固定取前 60 字」，
+    # 而是額外抽出售價、房屋名稱這種更有辨識度的 token，一起要求比對
+    # 到——避免只看一段文字前綴，被截斷或格式微調就整個比對失敗。
+    _PRICE_TOKEN_PATTERN = re.compile(r"[\d,]+\s*萬")
+    _TITLE_TOKEN_PATTERN = re.compile(r"【([^】]{2,30})】")
+
+    def _normalize_text(self, text: str) -> str:
+        """兩邊共用的正規化規則：NFKC 處理全形／半形字元與相容標點，
+        拿掉表情符號（已證實不會進到 Facebook 算出來的頁面文字），
+        並把所有連續空白（含換行、Facebook DOM 拆字產生的空白）收斂
+        成單一半形空白。"""
+        text = unicodedata.normalize("NFKC", text)
+        text = self._EMOJI_PATTERN.sub("", text)
+        return " ".join(text.split())
+
+    def _build_fingerprint(self, content: str) -> dict[str, str]:
+        """從一段文案（schedule 自己的 copy_text）算出用來辨識這篇貼文
+        的 fingerprint：內容開頭的 marker，加上（如果找得到）售價、
+        房屋名稱這兩個更有辨識度的 token。capture_published_post() 跟
+        delete_post() 都呼叫這裡，確保兩邊用的是同一套規則。"""
+        normalized = self._normalize_text(content)
+        marker = normalized[: self._CONTENT_MARKER_LENGTH]
+        price_match = self._PRICE_TOKEN_PATTERN.search(normalized)
+        title_match = self._TITLE_TOKEN_PATTERN.search(normalized)
+        return {
+            "marker": marker if len(marker) >= 10 else "",
+            "price_token": price_match.group(0) if price_match else "",
+            "title_token": title_match.group(1) if title_match else "",
+        }
+
+    def _fingerprint_matches_text(self, fingerprint: dict[str, str], page_text: str) -> bool:
+        """檢查一段頁面文字是否符合 fingerprint——marker 是必要條件，
+        售價／房屋名稱 token（如果 fingerprint 裡有）也都要比對到，
+        任何一項不符就視為不是同一篇貼文。"""
+        marker = fingerprint.get("marker", "")
+        if not marker:
+            return False
+        normalized_page = self._normalize_text(page_text)
+        if marker not in normalized_page:
+            return False
+        price_token = fingerprint.get("price_token", "")
+        if price_token and price_token not in normalized_page:
+            return False
+        title_token = fingerprint.get("title_token", "")
+        if title_token and title_token not in normalized_page:
+            return False
+        return True
+
     _OWN_NAME_FROM_COMPOSER_JS = r"""
         () => {
             const re = /^(.+?)，在想些什麼？$/;
@@ -703,8 +815,15 @@ class FacebookService:
     # 容器內是否有「明顯較舊」的負向時間訊號、以及容器內所有看起來
     # 像貼文/相片永久連結的 href（不再要求一定要跟某個時間戳記連結
     # 綁在一起才算數——已證實這種綁定在部分頁面根本不存在）。
+    #
+    # 2026-09-21：selector 從「這則貼文採取的動作」放寬成「貼文採取的
+    # 動作」——對著 schedule id=7 真實的 /photo/ 永久連結頁面實測發現，
+    # 那個頁面貼文自己的按鈕 aria-label 是「可對此貼文採取的動作」
+    # （沒有「這則」二字），跟動態消息／個人檔案頁面用的「對＿的這則
+    # 貼文採取的動作」是不同措辭，但共同尾巴都是「貼文採取的動作」。
     _SCAN_CANDIDATES_JS = r"""
-        (marker) => {
+        (fingerprint) => {
+            const { marker, priceToken, titleToken } = fingerprint;
             const AUTHOR_RE = /^對(.+)的這則貼文採取的動作$/;
             const COMPACT_TIME_RE = /^(剛剛|(\d+)\s*(秒|分鐘|小時|天|週)|昨天)$/;
             const RECENT_RE = /^(剛剛|(\d+)\s*(秒|分鐘|小時))/;
@@ -725,7 +844,7 @@ class FacebookService:
             }
 
             const moreBtns = Array.from(
-                document.querySelectorAll('[aria-label*="這則貼文採取的動作"]')
+                document.querySelectorAll('[aria-label*="貼文採取的動作"]')
             );
             const seenContainers = new Set();
             const results = [];
@@ -739,11 +858,18 @@ class FacebookService:
                 // 就超過任何合理門檻，卻完全還沒包含到貼文本文。改成
                 // 直接往上爬，爬到「這一層的文字真的包含 marker」才停，
                 // 這樣找到的一定是同時涵蓋按鈕與內容、且盡量小的容器。
+                // NFKC 正規化跟 Python 那邊的 _normalize_text() 對齊
+                // （全形／半形數字、標點、空白統一），不然 Python 建出來的
+                // marker/priceToken/titleToken 含有 NFKC 轉換後的半形
+                // 標點，這裡如果只做空白收斂、不做 NFKC，兩邊會永遠對不
+                // 起來——JS 字串原生支援 .normalize('NFKC')，跟 Python
+                // unicodedata.normalize('NFKC', ...) 是同一套 Unicode
+                // 正規化演算法。
                 let container = moreBtn;
                 let hops = 0;
                 let matched = false;
                 while (container && hops < 20) {
-                    const text = (container.innerText || '').replace(/\s+/g, ' ').trim();
+                    const text = (container.innerText || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
                     if (text.includes(marker)) { matched = true; break; }
                     container = container.parentElement;
                     hops += 1;
@@ -751,6 +877,12 @@ class FacebookService:
                 if (!matched || !container) continue;
                 if (seenContainers.has(container)) continue;
                 seenContainers.add(container);
+
+                // fingerprint 裡的售價／房屋名稱 token（如果有）也要在同一個
+                // 容器內找到，多一層交叉驗證，不是只靠內容前綴。
+                const containerFullText = (container.innerText || '').normalize('NFKC').replace(/\s+/g, ' ').trim();
+                if (priceToken && !containerFullText.includes(priceToken)) continue;
+                if (titleToken && !containerFullText.includes(titleToken)) continue;
 
                 const moreLabel = moreBtn.getAttribute('aria-label') || '';
                 const authorMatch = moreLabel.match(AUTHOR_RE);
@@ -809,11 +941,14 @@ class FacebookService:
         是哪一篇）——就直接回傳空字典，呼叫端維持既有安全機制（post_url
         留空 -> 需要人工刪除），絕對不會用猜的方式硬填一個 identifier。
 
-        用來比對的 marker 會先拿掉表情符號（🏠💰📍等）再截短到
-        _CONTENT_MARKER_LENGTH——同一次真實診斷發現表情符號不會進到
-        Facebook 算出來的 innerText（研判被畫成獨立的 <img>），而且
-        貼文預覽有「……查看更多」的截斷長度限制，marker 太長、或含有
-        表情符號，都會讓內容比對永遠比不到，跟容器選對不對完全無關。
+        用來比對的 fingerprint（見 _build_fingerprint()）會先拿掉表情
+        符號（🏠💰📍等）再截短到 _CONTENT_MARKER_LENGTH——同一次真實
+        診斷發現表情符號不會進到 Facebook 算出來的 innerText（研判被
+        畫成獨立的 <img>），而且貼文預覽有「……查看更多」的截斷長度
+        限制，marker 太長、或含有表情符號，都會讓內容比對永遠比不到，
+        跟容器選對不對完全無關。這套 fingerprint 邏輯跟 delete_post()
+        共用同一份（_build_fingerprint/_fingerprint_matches_text），
+        不會再各自維護一份不一致的比對規則。
 
         post_url 是必要欄位，post_id 是 optional——Facebook 現在的
         permalink 常用 pfbid 這種不透明英數字 token，不一定能可靠取得
@@ -836,9 +971,8 @@ class FacebookService:
         """
         effective_timeout_ms = timeout_ms if timeout_ms is not None else self._CAPTURE_TIMEOUT_MS
 
-        clean_content = self._EMOJI_PATTERN.sub("", content)
-        marker = " ".join(clean_content.strip().split())[: self._CONTENT_MARKER_LENGTH]
-        if len(marker) < 10:
+        fingerprint = self._build_fingerprint(content)
+        if not fingerprint["marker"]:
             return {}
 
         try:
@@ -869,7 +1003,7 @@ class FacebookService:
 
         elapsed = 0
         while elapsed < effective_timeout_ms:
-            result = self._scan_and_extract(page, marker, own_name)
+            result = self._scan_and_extract(page, fingerprint, own_name)
             if result:
                 return result
 
@@ -894,10 +1028,17 @@ class FacebookService:
         return base
 
     def _scan_and_extract(
-        self, page: Page, marker: str, own_name: str | None
+        self, page: Page, fingerprint: dict[str, str], own_name: str | None
     ) -> dict[str, str]:
         try:
-            candidates = page.evaluate(self._SCAN_CANDIDATES_JS, marker)
+            candidates = page.evaluate(
+                self._SCAN_CANDIDATES_JS,
+                {
+                    "marker": fingerprint.get("marker", ""),
+                    "priceToken": fingerprint.get("price_token", ""),
+                    "titleToken": fingerprint.get("title_token", ""),
+                },
+            )
         except Exception:
             return {}
 
