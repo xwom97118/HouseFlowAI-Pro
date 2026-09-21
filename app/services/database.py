@@ -344,18 +344,23 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
     def _seed_default_brand_profile(self, conn: sqlite3.Connection) -> None:
         """第一次啟動時的品牌／經紀業資訊種子值。只有在該 key 完全沒有
         值時才會寫入（set_default_setting 用 INSERT OR IGNORE），之後
-        使用者在設定頁改掉的內容永遠不會被這裡覆蓋。之所以在這裡而不是
-        寫死在 copywriting_engine.py，是因為這些是「這台機器目前使用者
-        的資料」，不是程式邏輯，未來其他房仲安裝 HouseFlow 時應該要能
-        完全換成自己的資料，而不必改程式碼。
+        使用者在設定頁改掉的內容永遠不會被這裡覆蓋。
+
+        2026-09-21 產品化 Phase 1：這裡原本直接寫死開發時測試帳號（阿嘉／
+        洺城開發企業社／真實證號）的資料，對「未來其他房仲安裝
+        HouseFlow」的全新安裝來說是錯的——會讓對方看到別人的姓名跟
+        真實證號當作預設值。全部改成空字串，全新安裝時設定頁會是空的，
+        由使用者自己填入。這裡完全不會動到已經存在的 production
+        app_settings 資料列（INSERT OR IGNORE 對已有值的 key 是 no-op），
+        只影響「從零開始的全新資料庫」會種出什麼種子值。
         """
         defaults = {
-            "display_name": "阿嘉",
-            "brand_slogan": "我是阿嘉，幫你更了解你的不動產價值。",
-            "default_hashtags": "#不動產買賣找阿嘉\n#龍潭成交策略",
-            "brokerage_name": "洺城開發企業社",
-            "salesperson_license": "（108）登字第352260號",
-            "broker_license": "（113）南市字第01004號",
+            "display_name": "",
+            "brand_slogan": "",
+            "default_hashtags": "",
+            "brokerage_name": "",
+            "salesperson_license": "",
+            "broker_license": "",
         }
         for key, value in defaults.items():
             self.set_default_setting(conn, key, value)

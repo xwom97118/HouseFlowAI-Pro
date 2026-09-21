@@ -22,7 +22,9 @@ from PySide6.QtWidgets import (
 
 from app.services import brand_profile
 from app.services.database import Database
+from app.services.license import MockLicenseProvider
 from app.widgets.common import SectionTitle
+from app.widgets.license_widgets import LicenseInfoPanel
 
 
 def _scrollable(inner: QWidget) -> QScrollArea:
@@ -58,6 +60,7 @@ class SettingsPage(QWidget):
         tabs.addTab(self._build_ai_tab(), "AI 文案設定")
         tabs.addTab(self._build_sync_tab(), "同步設定")
         tabs.addTab(self._build_automation_tab(), "排程設定")
+        tabs.addTab(self._build_license_tab(), "授權資訊")
         root.addWidget(tabs, 1)
 
         button_row = QHBoxLayout()
@@ -482,6 +485,22 @@ class SettingsPage(QWidget):
     def _cleanup_sync_history_now(self) -> None:
         removed = self.db.cleanup_old_sync_runs(self.sync_history_retention_days.value())
         QMessageBox.information(self, "已清理同步歷史", f"已清除 {removed} 筆超過保留天數的同步歷史紀錄。")
+
+    # ------------------------------------------------------------------
+    # 授權資訊（2026-09-21 產品化 Phase 1，規格第 19 節 J）
+    # ------------------------------------------------------------------
+
+    def _build_license_tab(self) -> QWidget:
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(0, 12, 12, 0)
+
+        license_service = MockLicenseProvider(self.db.get_setting, self.db.set_setting)
+        self.license_panel = LicenseInfoPanel(license_service, self.db.get_setting, self.db.set_setting)
+        layout.addWidget(self.license_panel)
+        layout.addStretch()
+
+        return _scrollable(content)
 
     # ------------------------------------------------------------------
 

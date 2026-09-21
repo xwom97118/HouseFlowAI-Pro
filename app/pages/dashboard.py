@@ -576,22 +576,10 @@ class DashboardPage(QWidget):
             "poster",
         )
 
-        if contacts == 0:
-            self._add_task(
-                "👥",
-                "建立第一筆客戶資料",
-                "開始整理買方與屋主名單",
-                "新增客戶",
-                "crm",
-            )
-        else:
-            self._add_task(
-                "👥",
-                "追蹤客戶進度",
-                f"目前共有 {contacts} 位客戶",
-                "查看 CRM",
-                "crm",
-            )
+        # 2026-09-21 產品化 Phase 1：CRM 在 V1 從導覽隱藏，這裡對應的
+        # 待辦建議（原本會導去 "crm"）一併拿掉，避免建議一個 sidebar
+        # 沒有入口的頁面。contacts 變數保留給 Dashboard 其他統計使用。
+        _ = contacts
 
         if drafts == 0:
             self.tip_label.setText(

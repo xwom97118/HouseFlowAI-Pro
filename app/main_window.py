@@ -71,7 +71,13 @@ class MainWindow(QMainWindow):
         self.group = QButtonGroup(self)
         self.group.setExclusive(True)
 
-        navs = [
+        # 2026-09-21 產品化 Phase 1：V1 功能精簡——AI 文案／成交策略／CRM
+        # 從 V1 導覽隱藏（程式、資料表、既有資料完全保留，見
+        # docs/PRODUCT_V1_SPEC.md 第 2 節）。之後版本要重新開放，只要把
+        # 對應項目加回 navs 清單即可，不需要改動任何其他邏輯。
+        V1_HIDDEN_NAV_KEYS = {"ai", "crm", "strategy"}
+
+        all_navs = [
             ("dashboard", "🏠", "Dashboard"),
             ("sync_center", "🔄", "同步中心"),
             ("properties", "🏡", "物件中心"),
@@ -84,6 +90,7 @@ class MainWindow(QMainWindow):
             ("analytics", "📈", "分析"),
             ("settings", "⚙", "設定"),
         ]
+        navs = [item for item in all_navs if item[0] not in V1_HIDDEN_NAV_KEYS]
 
         self.nav_buttons: dict[str, QPushButton] = {}
         nav_icon_size = QSize(20, 20)
@@ -378,7 +385,11 @@ class MainWindow(QMainWindow):
 
         self._refresh_sidebar_footer()
         self.stack.setCurrentWidget(page)
-        self.nav_buttons[key].setChecked(True)
+        # V1 隱藏的頁面（ai/crm/strategy）沒有對應的 sidebar 按鈕，但頁面
+        # 物件本身還在、還可以被內部呼叫（例如既有的「送到 AI 文案」入口）
+        # 導覽過去——這裡只是安全地跳過「勾選側邊欄按鈕」這一步。
+        if key in self.nav_buttons:
+            self.nav_buttons[key].setChecked(True)
 
         titles = {
             "dashboard": "Dashboard",

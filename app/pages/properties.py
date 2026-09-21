@@ -173,9 +173,15 @@ class PropertiesPage(QWidget):
         open_btn = QPushButton("開啟原始網頁")
         open_btn.setObjectName("SecondaryButton")
         open_btn.clicked.connect(self.open_url)
+        # 2026-09-21 產品化 Phase 1：AI 文案在 V1 從導覽隱藏（見
+        # main_window.py 的 V1_HIDDEN_NAV_KEYS），這個按鈕是它在物件
+        # 中心的入口，一併隱藏，避免點了卻導去一個 sidebar 沒有對應
+        # 按鈕的頁面。send_to_ai() 方法完全保留，之後重新開放只要把這行
+        # 拿掉即可。
         ai_btn = QPushButton("送到 AI 文案")
         ai_btn.setObjectName("SecondaryButton")
         ai_btn.clicked.connect(self.send_to_ai)
+        ai_btn.setVisible(False)
 
         # 2026-09-21 UX 重構：物件中心的主要操作——一個按鈕直接開啟
         # Quick Schedule Dialog，不用先跳到排程中心再選物件。

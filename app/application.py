@@ -12,8 +12,8 @@ from app.services import app_paths
 
 def run() -> None:
     app = QApplication(sys.argv)
-    app.setApplicationName("HouseFlow AI Professional")
-    app.setOrganizationName("HouseFlow AI")
+    app.setApplicationName("HouseFlow")
+    app.setOrganizationName("HouseFlow")
     app.setFont(QFont("Microsoft JhengHei UI", 10))
     app.setAttribute(Qt.ApplicationAttribute.AA_DontUseNativeMenuBar, True)
     # 關閉視窗（X）預設只是最小化到系統匣，不是真的結束程式（見
