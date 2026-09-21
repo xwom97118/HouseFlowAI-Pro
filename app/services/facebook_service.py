@@ -605,24 +605,65 @@ class FacebookService:
     _CAPTURE_TIMEOUT_MS = 90_000
     _CAPTURE_POLL_INTERVAL_MS = 3_000
 
-    # 2026-09-21 對著真實登入的 Facebook 帳號（facebook_browser_profile）
-    # 做過唯讀 DOM 檢查後確認：目前繁中介面的動態消息貼文，最外層「不」
-    # 使用 role="article"（那個 selector 只會抓到空的、還在 "載入中……"
-    # 的 loading-state 佔位元素，或是展開留言時、留言本身用的容器）。
-    # 每篇貼文真正可靠的邊界是帶 aria-posinset 屬性、且內部找得到
-    # 「對＿的這則貼文採取的動作」（貼文自己的「更多選項」選單按鈕）
-    # 的那個 wrapper——這個組合同時也能排除頁面最上方限時動態列表
-    # （同樣有 aria-posinset，但沒有這顆按鈕）。
+    # 2026-09-21 對著「schedule id=7 真實發布成功、但抓不到 permalink」
+    # 這篇真實存在的貼文做過唯讀 DOM 診斷後，確認了上一版（2026-09-21
+    # 稍早）的兩個假設都不成立：
+    # 1. 剛發布的貼文不保證會馬上出現在動態消息首頁——同一篇貼文在
+    #    首頁等了將近 8 分鐘都沒出現，但在帳號自己的「個人檔案／貼文」
+    #    頁面上立刻就看得到（screenshot 證實）。
+    # 2. aria-posinset 不是「一個 wrapper = 一篇貼文」的可靠邊界——這
+    #    只在動態消息首頁成立；在個人檔案頁面，貼文本身的容器根本沒有
+    #    aria-posinset 屬性（那個屬性出現在更高、範圍大很多的祖先上，
+    #    不對應單一貼文）。
+    # 3. 貼文自己的時間戳記文字（「剛剛」「N分鐘」）不保證存在於可讀取
+    #    的 DOM 裡——這篇真實貼文的容器內完全沒有任何 <time>/<abbr>、
+    #    也沒有任何連結帶著這種可見文字或 aria-label，即使畫面上明明
+    #    顯示著「11分鐘」。
+    #
+    # 因此改成：唯一可靠、兩種頁面都驗證過存在的錨點是「更多選項」
+    # 按鈕本身（aria-label 為「對＿的這則貼文採取的動作」），直接以
+    # 它為起點往上找「文字夠長」的最小容器當作貼文邊界，不再依賴
+    # aria-posinset。時間窗口驗證也不再要求 Facebook 必須顯示「剛剛／
+    # N分鐘」這段文字（已證實常常不存在）——改成用「我們自己知道剛按
+    # 下發布、只在有限的 polling 視窗內搜尋」作為時間佐證；但如果容器
+    # 內剛好找得到「N天／N週／昨天」這種明顯較舊的文字，仍然視為負向
+    # 訊號直接排除，避免誤認到同一物件之前貼過的舊貼文。
     _PERMALINK_SHAPE_PATTERN = re.compile(
         r"/posts/|/videos/|story_fbid=|permalink\.php|/photo(?:\.php|/)"
+    )
+    # 比 _PERMALINK_SHAPE_PATTERN 更嚴格：不含 /photo/，用來判斷「這個
+    # 候選是明確的貼文網址，還是只是相片網址」，同一群組裡優先保留前者。
+    _PERMALINK_IS_POST_SHAPE = re.compile(
+        r"/posts/|/videos/|story_fbid=|permalink\.php"
     )
     # 貼文永久連結的 ID 現在多半是 pfbid 開頭的英數字 token（例如
     # .../posts/pfbid02t7umeRc7HyxPh6...），不是只有數字，所以這裡除了
     # 舊版純數字樣式，也要接受 pfbid 樣式；抓不到 ID 不影響安全性，
-    # post_url 本身才是刪文流程實際要用的欄位。
+    # post_url 本身才是刪文流程實際要用的欄位（見下方 STEP 6：post_id
+    # 是 optional，post_url 才是 required）。
     _POST_ID_PATTERN = re.compile(
         r"(?:story_fbid=|/posts/|/videos/|[?&]fbid=)(pfbid[A-Za-z0-9]+|\d+)"
     )
+
+    # 2026-09-21 對著 schedule id=7 這篇真實貼文實測發現：貼文預覽文字
+    # 裡的表情符號（🏠💰📍等）完全沒有進到瀏覽器算出來的 innerText（研判
+    # 是畫成獨立的 <img>，不算文字內容），如果 marker 裡含有表情符號，
+    # 光是這一點就會讓內容比對永遠比不到，先把它們拿掉再比對。
+    _EMOJI_PATTERN = re.compile(
+        "["
+        "\U0001F300-\U0001FAFF"
+        "\U00002600-\U000027BF"
+        "\U0001F1E6-\U0001F1FF"
+        "\U00002190-\U000021FF"
+        "\U00002B00-\U00002BFF"
+        "]+",
+        flags=re.UNICODE,
+    )
+    # 同一次實測也發現：動態消息／個人檔案上的貼文預覽會用「……查看
+    # 更多」截斷過長內容，這篇貼文（去掉表情符號後）在第 70～79 字之間
+    # 被截斷；用 60 字當 marker 長度，在截斷點之前留有安全餘裕，同時
+    # 仍然足夠有辨識度（涵蓋不只一句話）。
+    _CONTENT_MARKER_LENGTH = 60
 
     _OWN_NAME_FROM_COMPOSER_JS = r"""
         () => {
@@ -638,18 +679,36 @@ class FacebookService:
         }
     """
 
-    # 掃描目前 DOM 裡所有「看起來像真正貼文」的 aria-posinset wrapper，
-    # 回傳每篇的：作者（從更多選項按鈕的 aria-label 解析）、內容是否
-    # 比對到 marker、以及所有「非留言」時間戳記連結（可見文字符合
-    # 剛剛／N秒／N分鐘／N小時／N天／昨天樣式，且其 permalink 形狀的
-    # href）。留言自己的時間戳記會被包在 role="article" 且 aria-label
-    # 是「＿的留言＿前」樣式的容器裡，這裡會排除掉，避免誤把留言的
-    # permalink 當成貼文本身的。
+    # 用「登入帳號本人的顯示名稱」找左側導覽列裡指向自己個人檔案的
+    # 連結，讀出 href——不是硬編碼特定帳號，任何房仲使用 HouseFlow
+    # 都適用，因為名字是從 _OWN_NAME_FROM_COMPOSER_JS 動態讀出來的。
+    _OWN_PROFILE_URL_FROM_NAV_JS = r"""
+        (ownName) => {
+            if (!ownName) return null;
+            const links = Array.from(document.querySelectorAll('a[href]'));
+            for (const a of links) {
+                const label = a.getAttribute('aria-label') || '';
+                const text = (a.textContent || '').trim();
+                if (label === ownName || text === ownName) {
+                    return a.getAttribute('href');
+                }
+            }
+            return null;
+        }
+    """
+
+    # 掃描目前 DOM 裡所有「更多選項」按鈕（貼文自己專屬的操作選單，
+    # 排除留言自己的留言操作選單），往上找最小的、內容夠長的共同容器
+    # 當作這篇貼文的邊界，回傳每篇的作者、內容是否比對到 marker、
+    # 容器內是否有「明顯較舊」的負向時間訊號、以及容器內所有看起來
+    # 像貼文/相片永久連結的 href（不再要求一定要跟某個時間戳記連結
+    # 綁在一起才算數——已證實這種綁定在部分頁面根本不存在）。
     _SCAN_CANDIDATES_JS = r"""
         (marker) => {
             const AUTHOR_RE = /^對(.+)的這則貼文採取的動作$/;
             const COMPACT_TIME_RE = /^(剛剛|(\d+)\s*(秒|分鐘|小時|天|週)|昨天)$/;
             const RECENT_RE = /^(剛剛|(\d+)\s*(秒|分鐘|小時))/;
+            const PERMALINK_RE = /\/posts\/|\/videos\/|story_fbid=|permalink\.php|\/photo(?:\.php|\/)/;
 
             function isInsideComment(el) {
                 let cur = el;
@@ -665,54 +724,53 @@ class FacebookService:
                 return false;
             }
 
-            const wrappers = Array.from(document.querySelectorAll('[aria-posinset]'));
+            const moreBtns = Array.from(
+                document.querySelectorAll('[aria-label*="這則貼文採取的動作"]')
+            );
+            const seenContainers = new Set();
             const results = [];
 
-            for (const wrapper of wrappers) {
-                const moreBtn = wrapper.querySelector('[aria-label*="這則貼文採取的動作"]');
-                if (!moreBtn) continue;
+            for (const moreBtn of moreBtns) {
+                if (isInsideComment(moreBtn)) continue;
+
+                // 不再用「文字長度 >= 門檻值」判斷有沒有爬到貼文邊界——
+                // 已證實按鈕附近常常先遇到一堆與內容無關的圖示 alt text
+                // （例如大量 alt="Facebook" 的裝飾用圖示），文字長度很快
+                // 就超過任何合理門檻，卻完全還沒包含到貼文本文。改成
+                // 直接往上爬，爬到「這一層的文字真的包含 marker」才停，
+                // 這樣找到的一定是同時涵蓋按鈕與內容、且盡量小的容器。
+                let container = moreBtn;
+                let hops = 0;
+                let matched = false;
+                while (container && hops < 20) {
+                    const text = (container.innerText || '').replace(/\s+/g, ' ').trim();
+                    if (text.includes(marker)) { matched = true; break; }
+                    container = container.parentElement;
+                    hops += 1;
+                }
+                if (!matched || !container) continue;
+                if (seenContainers.has(container)) continue;
+                seenContainers.add(container);
 
                 const moreLabel = moreBtn.getAttribute('aria-label') || '';
                 const authorMatch = moreLabel.match(AUTHOR_RE);
                 const author = authorMatch ? authorMatch[1] : null;
 
-                const wrapperText = (wrapper.innerText || '').replace(/\s+/g, ' ').trim();
-                const contentMatch = wrapperText.includes(marker);
+                // 容器內可能剛好包住展開的留言（留言有自己的時間戳記／
+                // 連結），這裡兩個收集都要排除留言範圍內的元素，不然
+                // 留言自己的「N天前」或連結會被誤判成貼文本身的訊號。
+                const shortTexts = Array.from(container.querySelectorAll('*'))
+                    .filter(el => el.children.length === 0 && !isInsideComment(el))
+                    .map(el => (el.textContent || '').trim())
+                    .filter(t => t.length > 0 && t.length <= 6 && COMPACT_TIME_RE.test(t));
+                const hasStaleSignal = shortTexts.some(t => !RECENT_RE.test(t));
 
-                const shortTextEls = Array.from(wrapper.querySelectorAll('*')).filter(el => {
-                    if (el.children.length !== 0) return false;
-                    const txt = (el.textContent || '').trim();
-                    return txt.length > 0 && txt.length <= 6 && COMPACT_TIME_RE.test(txt);
-                });
+                const hrefs = Array.from(container.querySelectorAll('a[href]'))
+                    .filter(a => !isInsideComment(a))
+                    .map(a => a.getAttribute('href'))
+                    .filter(h => h && PERMALINK_RE.test(h));
 
-                const timeCandidates = [];
-                for (const t of shortTextEls) {
-                    if (isInsideComment(t)) continue;
-                    const compactText = t.textContent.trim();
-                    let clickable = t;
-                    let hops = 0;
-                    while (clickable && hops < 8) {
-                        if (clickable.tagName === 'A' || clickable.getAttribute('role') === 'link') break;
-                        clickable = clickable.parentElement;
-                        hops += 1;
-                    }
-                    if (!clickable || (clickable.tagName !== 'A' && clickable.getAttribute('role') !== 'link')) continue;
-                    const href = clickable.getAttribute('href');
-                    if (!href) continue;
-                    timeCandidates.push({
-                        compactText,
-                        isRecent: RECENT_RE.test(compactText),
-                        href,
-                        ariaLabel: clickable.getAttribute('aria-label') || '',
-                    });
-                }
-
-                results.push({
-                    ariaPosinset: wrapper.getAttribute('aria-posinset'),
-                    author,
-                    contentMatch,
-                    timeCandidates,
-                });
+                results.push({ author, hasStaleSignal, hrefs });
             }
 
             return results;
@@ -733,11 +791,16 @@ class FacebookService:
         polling 都要求同時成立：
         1. 內容比對——候選貼文的可見文字包含這次發布內容一段夠長、
            有辨識度的開頭。
-        2. 時間交叉驗證——候選貼文自己（不是留言）的時間戳記文字要
-           看起來像是「剛剛／幾秒／幾分鐘／幾小時」，不是「幾天」
-           「昨天」之類明顯較舊的貼文。
-        3. permalink 格式驗證——時間戳記連結的 href 要像真的貼文／
-           相片永久連結。
+        2. 時間窗口——不再要求 Facebook 一定要顯示「剛剛／N分鐘」這段
+           文字（已證實常常不存在），改成「我們自己只在剛按下發布後
+           的有限 polling 視窗內搜尋」作為時間佐證；但如果容器內剛好
+           找到「N天／N週／昨天」這種明顯較舊的文字，仍視為負向訊號
+           直接排除，避免誤判成同一物件之前貼過的舊貼文。
+        3. permalink 格式驗證——貼文容器內要找到看起來像真的貼文／
+           相片永久連結（/posts/、/videos/、story_fbid=、
+           permalink.php、/photo/ 其中一種），且同一篇貼文對應的所有
+           候選網址（例如多張相片各自的 /photo/ 連結）唯一收斂成一個
+           判定結果。
         4. 作者交叉驗證（附加訊號，非必要條件）——如果讀得到目前登入
            帳號的真實顯示名稱，且這篇候選貼文的作者跟它不同，就直接
            排除這個候選；讀不到就不套用這一條，不影響前三條的判定。
@@ -746,17 +809,35 @@ class FacebookService:
         是哪一篇）——就直接回傳空字典，呼叫端維持既有安全機制（post_url
         留空 -> 需要人工刪除），絕對不會用猜的方式硬填一個 identifier。
 
-        2026-09-21 對著真實登入的帳號做過唯讀 DOM 檢查，確認了這裡用的
-        selector（aria-posinset 容器邊界、更多選項按鈕的作者名稱、
-        /posts/pfbid... 永久連結樣式）都是目前繁中介面實際存在的結構，
-        取代了先前那版完全建立在 role="article"（實際上抓不到任何貼文
-        內容）之上的舊邏輯。無法 100% 確認的部分（例如貼文自己的時間
-        戳記連結是否在每一種貼文版型下都用完全一樣的方式呈現）仍然
-        沒有絕對把握，找不到符合條件的唯一候選時一律回傳空字典。
+        用來比對的 marker 會先拿掉表情符號（🏠💰📍等）再截短到
+        _CONTENT_MARKER_LENGTH——同一次真實診斷發現表情符號不會進到
+        Facebook 算出來的 innerText（研判被畫成獨立的 <img>），而且
+        貼文預覽有「……查看更多」的截斷長度限制，marker 太長、或含有
+        表情符號，都會讓內容比對永遠比不到，跟容器選對不對完全無關。
+
+        post_url 是必要欄位，post_id 是 optional——Facebook 現在的
+        permalink 常用 pfbid 這種不透明英數字 token，不一定能可靠取得
+        傳統數字 post_id，但只要 post_url 唯一且經過驗證，刪文流程就
+        可以直接用它定位，不會因為抓不到 post_id 就判定整個 capture
+        失敗。
+
+        2026-09-21：先對著一篇真實已發布、但用舊版邏輯抓不到 permalink
+        的貼文做了唯讀 DOM 診斷，發現舊版建立在「動態消息首頁會馬上
+        顯示剛發的貼文」「aria-posinset 等於一篇貼文的邊界」「貼文一定
+        有可讀取的剛剛/N分鐘文字」這三個假設，在這篇真實貼文上全部不
+        成立——首頁等了 8 分鐘沒出現，貼文實際出現在帳號自己的個人
+        檔案頁面，且該頁面的貼文容器沒有 aria-posinset、也完全沒有
+        任何時間戳記文字或連結。這一版改用「更多選項按鈕」當唯一穩定
+        錨點、改成優先導覽到帳號自己的個人檔案頁面尋找，並把「時間
+        窗口」驗證從「讀取 Facebook 顯示的相對時間文字」改成「我們自己
+        的 polling 時間範圍 + 負向時間訊號排除」，已經直接對著這篇真實
+        貼文驗證過可以成功抓到 post_url（見 test_post_capture.py /
+        test_post_capture_fixture.py 的對應案例）。
         """
         effective_timeout_ms = timeout_ms if timeout_ms is not None else self._CAPTURE_TIMEOUT_MS
 
-        marker = " ".join(content.strip().split())[:80]
+        clean_content = self._EMOJI_PATTERN.sub("", content)
+        marker = " ".join(clean_content.strip().split())[: self._CONTENT_MARKER_LENGTH]
         if len(marker) < 10:
             return {}
 
@@ -764,6 +845,27 @@ class FacebookService:
             own_name = page.evaluate(self._OWN_NAME_FROM_COMPOSER_JS)
         except Exception:
             own_name = None
+
+        # 優先導覽到帳號自己的個人檔案頁面——已證實剛發布的貼文會立刻
+        # 出現在那裡，動態消息首頁不一定會（2026-09-21 真實測試曾經
+        # 等了 8 分鐘都沒出現在首頁）。找不到個人檔案連結、或導覽失敗，
+        # 就留在原本頁面繼續掃描，不會讓整個捕捉流程因此中止。
+        if own_name:
+            try:
+                profile_href = page.evaluate(self._OWN_PROFILE_URL_FROM_NAV_JS, own_name)
+            except Exception:
+                profile_href = None
+            if profile_href:
+                profile_url = (
+                    profile_href
+                    if profile_href.startswith("http")
+                    else f"https://www.facebook.com{profile_href}"
+                )
+                try:
+                    page.goto(profile_url, wait_until="domcontentloaded", timeout=15_000)
+                    page.wait_for_timeout(3000)
+                except Exception:
+                    pass
 
         elapsed = 0
         while elapsed < effective_timeout_ms:
@@ -776,6 +878,21 @@ class FacebookService:
 
         return {}
 
+    def _permalink_group_key(self, post_url: str) -> str:
+        """把同一篇貼文的多個候選網址（例如多張相片各自的 /photo/
+        連結、或同一個連結重複出現但追蹤參數不同）歸成同一組，
+        判斷「唯一候選」時才不會被雜訊誤判成多篇。"""
+        if "/photo" in post_url:
+            match = re.search(r"[?&]set=([^&]+)", post_url)
+            if match:
+                return f"photo-set:{match.group(1)}"
+        # 拿掉 Facebook 自己加的追蹤參數（__cft__/__tn__），只留下真正
+        # 用來定位貼文的路徑，避免同一篇貼文因為追蹤參數不同就被誤判
+        # 成兩個不同候選。
+        base = post_url.split("&__cft__")[0].split("?__cft__")[0]
+        base = base.split("&__tn__")[0].split("?__tn__")[0]
+        return base
+
     def _scan_and_extract(
         self, page: Page, marker: str, own_name: str | None
     ) -> dict[str, str]:
@@ -787,31 +904,39 @@ class FacebookService:
         strong_matches: list[dict[str, str]] = []
 
         for candidate in candidates or []:
-            if not candidate.get("contentMatch"):
+            if candidate.get("hasStaleSignal"):
                 continue
             author = candidate.get("author")
             if own_name and author and author != own_name:
                 continue
 
-            for time_candidate in candidate.get("timeCandidates") or []:
-                if not time_candidate.get("isRecent"):
-                    continue
-                href = time_candidate.get("href") or ""
-                if not href:
-                    continue
+            groups: dict[str, str] = {}
+            for href in candidate.get("hrefs") or []:
                 post_url = href if href.startswith("http") else f"https://www.facebook.com{href}"
                 if not self._PERMALINK_SHAPE_PATTERN.search(post_url):
                     continue
+                key = self._permalink_group_key(post_url)
+                if key not in groups:
+                    groups[key] = post_url
+                elif self._PERMALINK_IS_POST_SHAPE.search(post_url) and not self._PERMALINK_IS_POST_SHAPE.search(
+                    groups[key]
+                ):
+                    # 同一群組內，優先保留明確的貼文網址而不是相片網址。
+                    groups[key] = post_url
 
-                post_id = ""
-                id_match = self._POST_ID_PATTERN.search(post_url)
-                if id_match:
-                    post_id = id_match.group(1)
+            if len(groups) != 1:
+                continue
 
-                strong_matches.append({"post_url": post_url, "post_id": post_id})
+            post_url = next(iter(groups.values()))
+            post_id = ""
+            id_match = self._POST_ID_PATTERN.search(post_url)
+            if id_match:
+                post_id = id_match.group(1)
 
-        # 同一輪掃描裡只要出現一個以上不同的候選 permalink，代表無法
-        # 唯一判定是哪一篇，安全起見一律不採信、回傳空字典。
+            strong_matches.append({"post_url": post_url, "post_id": post_id})
+
+        # 同一輪掃描裡只要出現一個以上不同的候選貼文，代表無法唯一
+        # 判定是哪一篇，安全起見一律不採信、回傳空字典。
         unique_urls = {m["post_url"] for m in strong_matches}
         if len(unique_urls) == 1:
             return strong_matches[0]
