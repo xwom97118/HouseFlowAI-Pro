@@ -1469,6 +1469,26 @@ CREATE TABLE IF NOT EXISTS facebook_groups (
         with self.connect() as conn:
             return [dict(row) for row in conn.execute(sql, tuple(params)).fetchall()]
 
+    def latest_schedule_by_property(self) -> dict[int, dict[str, Any]]:
+        """每個物件最新（id 最大）的一筆排程摘要——物件中心用這個顯示
+        「未排程／已排程／已發布／發布失敗」狀態，不必為了這個額外查詢
+        整張 schedules table 的所有欄位。純唯讀，不影響任何 automation
+        邏輯，只是給 UI 顯示用的投影。
+        """
+        sql = """
+            SELECT s.property_id, s.status, s.scheduled_at, s.published_at,
+                   s.delete_status, s.delete_at, s.error_message
+            FROM schedules s
+            INNER JOIN (
+                SELECT property_id, MAX(id) AS max_id
+                FROM schedules
+                GROUP BY property_id
+            ) latest ON latest.property_id = s.property_id AND latest.max_id = s.id
+        """
+        with self.connect() as conn:
+            rows = conn.execute(sql).fetchall()
+        return {int(row["property_id"]): dict(row) for row in rows if row["property_id"] is not None}
+
     def _update_schedule(self, schedule_id: int, **fields: Any) -> None:
         if not fields:
             return

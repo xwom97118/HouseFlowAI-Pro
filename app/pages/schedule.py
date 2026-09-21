@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import webbrowser
 from collections.abc import Callable
 
-from PySide6.QtCore import QDateTime, Qt
+from PySide6.QtCore import QDateTime, QTimer, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -12,6 +13,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
@@ -26,14 +29,16 @@ from app.services.schedule_runner import ScheduleDeleteRunner, SchedulePublishRu
 from app.widgets.common import ClickableMetricCard, SectionTitle, show_toast
 from app.widgets.schedule_dialog import DeleteRuleSelector, NewScheduleDialog, ScheduleTimePicker
 
+# 2026-09-21 UX 重構：狀態文字改成更口語、使用者一看就懂的講法（DB 原始
+# status 值完全不變，這裡純粹是 UI 呈現層的翻譯表）。
 STATUS_LABELS = {
     "draft": "草稿",
     "pending_review": "待檢核",
-    "scheduled": "待發布",
+    "scheduled": "等待發布",
     "publishing": "發布中",
     "published": "已發布",
     "failed": "發布失敗",
-    "needs_review": "需要人工確認",
+    "needs_review": "需要確認",
     "cancelled": "已取消",
     "deleted": "已刪除",
 }
@@ -65,11 +70,11 @@ STATUS_COLORS = {
 
 DELETE_STATUS_LABELS = {
     "not_scheduled": "不自動刪除",
-    "pending": "待刪除",
+    "pending": "等待刪除",
     "deleting": "刪除中",
     "deleted": "已刪除",
     "delete_failed": "刪除失敗",
-    "manual_required": "需人工刪除",
+    "manual_required": "需要確認",
     "cancelled": "已取消刪除",
 }
 
@@ -84,14 +89,17 @@ DELETE_STATUS_DOTS = {
 }
 
 # (tab 標籤, status 篩選, delete_status 篩選) —— 兩者都是 None 代表不篩選。
+# "已完成" 是複合條件（已發布 且 沒有還在等待的自動刪除），用 COMPLETED_TAB_LABEL
+# 標記，_refresh_table() 裡另外用 Python 端過濾，不是單純的 status IN (...)。
+COMPLETED_TAB_LABEL = "已完成"
 TABS: list[tuple[str, list[str] | None, list[str] | None]] = [
     ("全部", None, None),
     ("待檢核", ["pending_review"], None),
     ("待發布", ["scheduled"], None),
     ("已發布", ["published"], None),
-    ("失敗", ["failed", "needs_review"], None),
     ("待刪除", None, ["pending"]),
-    ("已刪除", None, ["deleted"]),
+    (COMPLETED_TAB_LABEL, ["published"], None),
+    ("失敗", ["failed", "needs_review"], None),
 ]
 
 
@@ -140,12 +148,12 @@ class ScheduleCenterPage(QWidget):
         self.card_delete_pending = ClickableMetricCard("今日待刪除", "0")
         self.card_deleted = ClickableMetricCard("今日已刪除", "0")
         card_to_tab = {
-            self.card_pending: 1,
-            self.card_scheduled: 2,
-            self.card_published: 3,
-            self.card_failed: 4,
-            self.card_delete_pending: 5,
-            self.card_deleted: 6,
+            self.card_pending: 1,        # 待檢核
+            self.card_scheduled: 2,      # 待發布
+            self.card_published: 3,      # 已發布
+            self.card_delete_pending: 4,  # 待刪除
+            self.card_deleted: 5,        # 已完成（含今日已刪除的項目）
+            self.card_failed: 6,         # 失敗
         }
         for card, tab_index in card_to_tab.items():
             card.clicked.connect(lambda _=False, idx=tab_index: self.set_tab(idx))
@@ -180,6 +188,18 @@ class ScheduleCenterPage(QWidget):
         tabs_row.addStretch()
         root.addLayout(tabs_row)
 
+        # 搜尋框：搜尋物件名稱／文案內容 ------------------------------------
+        search_row = QHBoxLayout()
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("搜尋物件 / 文案…")
+        self._search_debounce = QTimer(self)
+        self._search_debounce.setSingleShot(True)
+        self._search_debounce.setInterval(250)
+        self._search_debounce.timeout.connect(self._refresh_table)
+        self.search.textChanged.connect(lambda _=None: self._search_debounce.start())
+        search_row.addWidget(self.search, 1)
+        root.addLayout(search_row)
+
         # Bulk actions：只有多選時才出現 ----------------------------------
         self.bulk_bar = QFrame()
         self.bulk_bar.setObjectName("Card")
@@ -213,25 +233,45 @@ class ScheduleCenterPage(QWidget):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         root.addWidget(self.table, 1)
 
-        # 情境式操作列：依照目前選取的排程狀態，只顯示真正需要的操作 -------
+        # 2026-09-21 UX 重構：原本 12 個按鈕全部同時顯示，使用者不知道要
+        # 按哪一個。改成「1 個 Primary Action + ⋯ 更多」——每一列排程依照
+        # 目前狀態只給一個最該做的動作，其他低頻操作收進「⋯」選單裡。
+        # 所有原本的 handler 方法完全不變，只是換一種方式曝露在 UI 上。
         actions_row = QHBoxLayout()
         actions_row.setSpacing(8)
 
-        self.view_btn = self._action_button("查看詳情", self.view_selected, actions_row)
-        self.submit_draft_btn = self._action_button("送出待檢核", self.submit_draft_selected, actions_row)
-        self.approve_btn = self._action_button("核准", self.approve_selected, actions_row)
-        self.reject_btn = self._action_button("退回修改", self.reject_selected, actions_row)
-        self.modify_time_btn = self._action_button("修改時間", self.modify_time_selected, actions_row)
-        self.publish_btn = self._action_button("立即發布", self.publish_selected, actions_row)
-        self.resolve_btn = self._action_button("處理需要確認", self.resolve_needs_review_selected, actions_row)
-        self.delete_post_btn = self._action_button("刪除貼文", self.delete_post_selected, actions_row)
-        self.modify_delete_btn = self._action_button("修改刪除時間", self.modify_delete_rule_selected, actions_row)
-        self.cancel_delete_btn = self._action_button("取消自動刪除", self.cancel_auto_delete_selected, actions_row)
-        self.cancel_btn = self._action_button("取消排程", self.cancel_selected, actions_row)
-        self.delete_btn = self._action_button("刪除紀錄", self.delete_selected, actions_row)
+        self.primary_btn = QPushButton("")
+        self.primary_btn.setObjectName("PrimaryButton")
+        self.primary_btn.clicked.connect(self._run_primary_action)
+        actions_row.addWidget(self.primary_btn)
+
+        self.more_btn = QPushButton("⋯ 更多")
+        self.more_btn.setObjectName("SecondaryButton")
+        self.more_btn.clicked.connect(self._open_more_menu)
+        actions_row.addWidget(self.more_btn)
 
         actions_row.addStretch()
         root.addLayout(actions_row)
+
+        # 保留原本的 handler 對照表：_primary_action_for()/_more_actions_for()
+        # 用狀態決定要呼叫哪一個，行為完全不變。
+        self._action_handlers: dict[str, Callable[[], None]] = {
+            "view": self.view_selected,
+            "submit_draft": self.submit_draft_selected,
+            "approve": self.approve_selected,
+            "reject": self.reject_selected,
+            "modify_time": self.modify_time_selected,
+            "publish": self.publish_selected,
+            "resolve": self.resolve_needs_review_selected,
+            "delete_post": self.delete_post_selected,
+            "modify_delete": self.modify_delete_rule_selected,
+            "cancel_delete": self.cancel_auto_delete_selected,
+            "cancel": self.cancel_selected,
+            "delete_record": self.delete_selected,
+            "open_post": self.open_post_url_selected,
+            "show_reason": self.show_failure_reason_selected,
+        }
+        self._current_primary_action: str | None = None
 
         self.status_label = QLabel("準備完成")
         self.status_label.setObjectName("MutedLabel")
@@ -239,14 +279,6 @@ class ScheduleCenterPage(QWidget):
 
         self.tab_buttons[self.tab_index].setChecked(True)
         self.refresh()
-
-    @staticmethod
-    def _action_button(label: str, handler, layout: QHBoxLayout) -> QPushButton:
-        button = QPushButton(label)
-        button.setObjectName("SecondaryButton")
-        button.clicked.connect(handler)
-        layout.addWidget(button)
-        return button
 
     # ------------------------------------------------------------------
 
@@ -277,7 +309,17 @@ class ScheduleCenterPage(QWidget):
     def _refresh_table(self) -> None:
         selected_ids = set(self._selected_ids())
         statuses, delete_statuses = self._current_filter()
-        self.rows = self.db.list_schedules(statuses=statuses, delete_statuses=delete_statuses)
+        search_text = self.search.text().strip() if hasattr(self, "search") else ""
+        self.rows = self.db.list_schedules(statuses=statuses, delete_statuses=delete_statuses, search=search_text)
+
+        # 「已完成」是複合條件（已發布 且 沒有還在等待的自動刪除），
+        # list_schedules() 只能篩 status IN (...) / delete_status IN (...)，
+        # 這裡在 Python 端再過濾一次，不影響 list_schedules() 給其他呼叫端用。
+        if TABS[self.tab_index][0] == COMPLETED_TAB_LABEL:
+            self.rows = [
+                row for row in self.rows
+                if row.get("delete_status") not in ("pending", "deleting")
+            ]
 
         is_review_tab = TABS[self.tab_index][0] == "待檢核"
         self.approve_all_btn.setVisible(is_review_tab)
@@ -356,36 +398,115 @@ class ScheduleCenterPage(QWidget):
         else:
             self.bulk_bar.setVisible(False)
 
-        buttons = (
-            self.view_btn, self.submit_draft_btn, self.approve_btn, self.reject_btn,
-            self.modify_time_btn, self.publish_btn, self.resolve_btn, self.delete_post_btn,
-            self.modify_delete_btn, self.cancel_delete_btn, self.cancel_btn, self.delete_btn,
-        )
-
         if not row or len(selected_ids) > 1:
-            for button in buttons:
-                button.setVisible(False)
+            self.primary_btn.setVisible(False)
+            self.more_btn.setVisible(False)
+            self._current_primary_action = None
             return
 
+        primary, more = self._build_action_plan(row)
+        primary_key, primary_label = primary
+        self.primary_btn.setVisible(True)
+        self.primary_btn.setText(primary_label)
+        self._current_primary_action = primary_key
+        self.more_btn.setVisible(bool(more))
+        self._current_more_actions = more
+
+    @staticmethod
+    def _build_action_plan(row: dict) -> tuple[tuple[str, str], list[tuple[str, str]]]:
+        """依排程目前狀態決定「1 個 Primary Action + 更多選單裡有哪些」。
+        每一列只給使用者最該做的那一個動作，其餘收進「⋯」——取代原本
+        12 顆按鈕同時攤開的畫面。所有 action key 對應的 handler 完全
+        沿用既有方法，行為不變。
+        """
         status = row.get("status", "")
         delete_status = row.get("delete_status", "")
         has_post_url = bool(str(row.get("post_url") or "").strip())
 
-        self.view_btn.setVisible(True)
-        self.submit_draft_btn.setVisible(status == "draft")
-        self.approve_btn.setVisible(status == "pending_review")
-        self.reject_btn.setVisible(status == "pending_review")
-        self.modify_time_btn.setVisible(status == "scheduled")
-        self.publish_btn.setVisible(status in ("scheduled", "failed"))
-        self.publish_btn.setText("重新嘗試" if status == "failed" else "立即發布")
-        self.resolve_btn.setVisible(status == "needs_review")
-        self.delete_post_btn.setVisible(status == "published" and has_post_url)
-        self.modify_delete_btn.setVisible(
-            status == "published" and delete_status in ("pending", "manual_required")
+        if status == "draft":
+            return ("submit_draft", "送出待檢核"), [
+                ("view", "查看詳情"), ("cancel", "取消排程"), ("delete_record", "刪除紀錄"),
+            ]
+        if status == "pending_review":
+            return ("approve", "核准"), [
+                ("reject", "退回修改"), ("view", "查看詳情"),
+                ("cancel", "取消排程"), ("delete_record", "刪除紀錄"),
+            ]
+        if status == "scheduled":
+            return ("modify_time", "編輯"), [
+                ("publish", "立即發布"), ("view", "查看詳情"),
+                ("cancel", "取消排程"), ("delete_record", "刪除紀錄"),
+            ]
+        if status == "publishing":
+            return ("view", "查看詳情"), []
+        if status == "published":
+            more: list[tuple[str, str]] = []
+            if delete_status == "pending":
+                more.append(("cancel_delete", "取消自動刪除"))
+                more.append(("modify_delete", "修改刪除時間"))
+                if has_post_url:
+                    more.append(("delete_post", "立即刪除貼文"))
+            elif delete_status == "manual_required":
+                if has_post_url:
+                    more.append(("delete_post", "立即刪除貼文"))
+                more.append(("modify_delete", "設定自動刪除"))
+            else:
+                more.append(("modify_delete", "設定自動刪除"))
+            more.append(("view", "查看詳情"))
+            more.append(("delete_record", "刪除紀錄"))
+            primary = ("open_post", "查看貼文") if has_post_url else ("view", "查看詳情")
+            return primary, more
+        if status == "failed":
+            return ("show_reason", "查看原因"), [
+                ("publish", "重新嘗試"), ("cancel", "取消排程"),
+                ("view", "查看詳情"), ("delete_record", "刪除紀錄"),
+            ]
+        if status == "needs_review":
+            return ("resolve", "處理需要確認"), [
+                ("show_reason", "查看原因"), ("view", "查看詳情"),
+                ("cancel", "取消排程"), ("delete_record", "刪除紀錄"),
+            ]
+        # cancelled / deleted 等終態
+        return ("view", "查看詳情"), [("delete_record", "刪除紀錄")]
+
+    def _run_primary_action(self) -> None:
+        if self._current_primary_action is None:
+            return
+        handler = self._action_handlers.get(self._current_primary_action)
+        if callable(handler):
+            handler()
+
+    def _open_more_menu(self) -> None:
+        if not getattr(self, "_current_more_actions", None):
+            return
+        menu = QMenu(self)
+        for action_key, label in self._current_more_actions:
+            handler = self._action_handlers.get(action_key)
+            if not callable(handler):
+                continue
+            action = menu.addAction(label)
+            action.triggered.connect(handler)
+        menu.exec(self.more_btn.mapToGlobal(self.more_btn.rect().bottomLeft()))
+
+    def open_post_url_selected(self) -> None:
+        row = self._require_selection()
+        if not row:
+            return
+        post_url = str(row.get("post_url") or "").strip()
+        if not post_url:
+            QMessageBox.information(self, "沒有貼文網址", "這筆排程沒有可靠的貼文網址。")
+            return
+        webbrowser.open(post_url)
+
+    def show_failure_reason_selected(self) -> None:
+        row = self._require_selection()
+        if not row:
+            return
+        reason = str(row.get("error_message") or "").strip() or "未提供失敗原因。"
+        QMessageBox.information(
+            self, "失敗原因",
+            f"「{row.get('property_title', '')} - {row.get('target_label', '')}」\n\n{reason}",
         )
-        self.cancel_delete_btn.setVisible(delete_status == "pending")
-        self.cancel_btn.setVisible(status in ("draft", "pending_review", "scheduled", "failed", "needs_review"))
-        self.delete_btn.setVisible(status != "publishing")
 
     # ------------------------------------------------------------------
 
@@ -462,6 +583,18 @@ class ScheduleCenterPage(QWidget):
             QMessageBox.information(self, "尚未選擇排程", "請先在列表中選擇一筆排程。")
         return row
 
+    def _set_busy(self, text: str = "處理中…") -> None:
+        """任何動作只要需要等待，Primary Action 立刻 disabled + 改成
+        「處理中…」，不讓使用者按下去畫面完全沒反應——不管這個動作是從
+        Primary 按鈕還是「⋯」選單觸發的，都統一走這裡。"""
+        self.primary_btn.setEnabled(False)
+        self.more_btn.setEnabled(False)
+        self.primary_btn.setText(text)
+
+    def _clear_busy(self) -> None:
+        self.primary_btn.setEnabled(True)
+        self.more_btn.setEnabled(True)
+
     def submit_draft_selected(self) -> None:
         row = self._require_selection()
         if not row:
@@ -470,9 +603,9 @@ class ScheduleCenterPage(QWidget):
         if not scheduled_at:
             scheduled_at = QDateTime.currentDateTime().addSecs(3 * 3600).toString("yyyy-MM-dd HH:mm:00")
 
-        self.submit_draft_btn.setEnabled(False)
+        self._set_busy("送出中…")
         self.db.submit_draft(int(row["id"]), scheduled_at)
-        self.submit_draft_btn.setEnabled(True)
+        self._clear_busy()
         show_toast(self, "✓ 已送出待檢核", kind="success")
         self.refresh()
 
@@ -480,10 +613,9 @@ class ScheduleCenterPage(QWidget):
         row = self._require_selection()
         if not row:
             return
-        self.approve_btn.setEnabled(False)
-        self.approve_btn.setText("核准中…")
+        self._set_busy("核准中…")
         self.db.approve_schedule(int(row["id"]))
-        self.approve_btn.setEnabled(True)
+        self._clear_busy()
         show_toast(self, "✓ 已核准", kind="success")
         self.refresh()
 
@@ -659,8 +791,7 @@ class ScheduleCenterPage(QWidget):
             return
 
         schedule_id = int(row["id"])
-        self.delete_post_btn.setEnabled(False)
-        self.delete_post_btn.setText("刪除中…")
+        self._set_busy("刪除中…")
         self.status_label.setText(f"正在刪除貼文：{row.get('property_title', '')} - {row.get('target_label', '')} ……")
 
         self.delete_runner = ScheduleDeleteRunner(self.db, row)
@@ -685,8 +816,7 @@ class ScheduleCenterPage(QWidget):
         if self.delete_runner is not None:
             self.delete_runner.wait_and_cleanup()
         self.delete_runner = None
-        self.delete_post_btn.setEnabled(True)
-        self.delete_post_btn.setText("刪除貼文")
+        self._clear_busy()
         self.refresh()
 
     def modify_delete_rule_selected(self) -> None:
@@ -757,9 +887,6 @@ class ScheduleCenterPage(QWidget):
         schedule_id = int(row["id"])
         self.db.mark_schedule_publishing(schedule_id)
         self.refresh()
-
-        self.publish_btn.setEnabled(False)
-        self.publish_btn.setText("發布中…")
         self.status_label.setText(f"正在發布：{row.get('property_title', '')} - {target_label} ……")
 
         self.runner = SchedulePublishRunner(self.db, row)
@@ -786,8 +913,6 @@ class ScheduleCenterPage(QWidget):
         if self.runner is not None:
             self.runner.wait_and_cleanup()
         self.runner = None
-        self.publish_btn.setEnabled(True)
-        self.publish_btn.setText("立即發布")
         self.refresh()
 
     # ------------------------------------------------------------------

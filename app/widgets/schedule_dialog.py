@@ -127,7 +127,12 @@ class DeleteRuleSelector(QWidget):
     PRESET_DAYS = (1, 3, 7, 15, 30)
     _UNSET = object()
 
-    def __init__(self, db: Database, preset_days: int | None = _UNSET) -> None:
+    def __init__(
+        self,
+        db: Database,
+        preset_days: int | None = _UNSET,
+        preset_days_options: tuple[int, ...] | None = None,
+    ) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -135,6 +140,7 @@ class DeleteRuleSelector(QWidget):
 
         self.group = QButtonGroup(self)
         self.radios: list[tuple[QRadioButton, int | None]] = []
+        preset_options = preset_days_options if preset_days_options is not None else self.PRESET_DAYS
 
         if preset_days is self._UNSET:
             try:
@@ -153,7 +159,7 @@ class DeleteRuleSelector(QWidget):
         layout.addLayout(none_row)
 
         preset_row = QHBoxLayout()
-        for days in self.PRESET_DAYS:
+        for days in preset_options:
             radio = QRadioButton(f"發布後 {days} 天")
             self.group.addButton(radio)
             self.radios.append((radio, days))

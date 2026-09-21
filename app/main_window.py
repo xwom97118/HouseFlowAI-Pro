@@ -156,6 +156,7 @@ class MainWindow(QMainWindow):
                 self.db,
                 self.open_ai_for_property,
                 lambda: self.navigate("dashboard"),
+                go_schedule=lambda: self.navigate("schedule"),
             ),
             "poster": PosterPage(
                 self.db,

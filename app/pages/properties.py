@@ -3,12 +3,13 @@ from __future__ import annotations
 import webbrowser
 from collections.abc import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QDateTime, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -22,8 +23,10 @@ from PySide6.QtWidgets import (
 )
 
 from app.services.database import Database
+from app.services.schedule_runner import SchedulePublishRunner
 from app.services.sync_runner import SyncRunner
-from app.widgets.common import SectionTitle
+from app.widgets.common import SectionTitle, show_toast
+from app.widgets.quick_schedule_dialog import QuickScheduleDialog
 from app.widgets.universal_import_dialog import UniversalImportDialog
 
 DEFAULT_SOURCE_URL = (
@@ -50,19 +53,58 @@ def _format_price_delta(old_value: str, new_value: str) -> str:
     return f"{arrow} {abs(old_num - new_num):g}萬"
 
 
+def _short_dt(value: str) -> str:
+    if not value:
+        return ""
+    dt = QDateTime.fromString(value, "yyyy-MM-dd HH:mm:ss")
+    return dt.toString("M/d HH:mm") if dt.isValid() else value
+
+
+# 2026-09-21 UX 重構：物件中心新增的排程狀態欄——把 schedules table 的
+# 原始狀態值（scheduled/publishing/published/failed/...）換成使用者
+# 看得懂的一句話，不用進排程中心才知道「這個物件現在是什麼狀態」。
+def _schedule_status_cell(latest: dict | None) -> tuple[str, tuple[str, str]]:
+    if not latest:
+        return "未排程", ("#E5E9F0", "#526176")
+
+    status = latest.get("status", "")
+    delete_status = latest.get("delete_status", "")
+    delete_at = latest.get("delete_at", "")
+
+    if status in ("draft", "pending_review", "scheduled"):
+        text = f"🟡 已排程 {_short_dt(latest.get('scheduled_at', ''))}"
+        return text, ("#FEF3C7", "#B45309")
+    if status == "publishing":
+        return "🔵 發布中", ("#DBEAFE", "#1D4ED8")
+    if status == "published":
+        text = f"🟢 已發布 {_short_dt(latest.get('published_at', ''))}"
+        if delete_status == "pending" and delete_at:
+            text += f"　🗑 {_short_dt(delete_at)}"
+        return text, ("#DCFCE7", "#15803D")
+    if status in ("failed", "needs_review"):
+        return "🔴 發布失敗", ("#FEE2E2", "#B91C1C")
+    if status == "cancelled":
+        return "⚪ 已取消", ("#E5E9F0", "#526176")
+    return status or "未排程", ("#E5E9F0", "#526176")
+
+
 class PropertiesPage(QWidget):
     def __init__(
         self,
         db: Database,
         open_ai: Callable[[int], None],
         go_dashboard: Callable[[], None],
+        go_schedule: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self.db = db
         self.open_ai = open_ai
         self.go_dashboard = go_dashboard
+        self.go_schedule = go_schedule
         self.runner: SyncRunner | None = None
+        self.publish_runner: SchedulePublishRunner | None = None
         self.rows: list[dict] = []
+        self.schedule_status_map: dict[int, dict] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(24, 22, 24, 24)
@@ -132,8 +174,14 @@ class PropertiesPage(QWidget):
         open_btn.setObjectName("SecondaryButton")
         open_btn.clicked.connect(self.open_url)
         ai_btn = QPushButton("送到 AI 文案")
-        ai_btn.setObjectName("PrimaryButton")
+        ai_btn.setObjectName("SecondaryButton")
         ai_btn.clicked.connect(self.send_to_ai)
+
+        # 2026-09-21 UX 重構：物件中心的主要操作——一個按鈕直接開啟
+        # Quick Schedule Dialog，不用先跳到排程中心再選物件。
+        self.schedule_btn = QPushButton("📅 安排發文")
+        self.schedule_btn.setObjectName("PrimaryButton")
+        self.schedule_btn.clicked.connect(self.open_quick_schedule)
 
         tools.addWidget(self.search, 1)
         tools.addWidget(self.favorites_only)
@@ -144,15 +192,16 @@ class PropertiesPage(QWidget):
         tools.addWidget(note_btn)
         tools.addWidget(open_btn)
         tools.addWidget(ai_btn)
+        tools.addWidget(self.schedule_btn)
         root.addLayout(tools)
 
         self.status_label = QLabel("準備完成")
         self.status_label.setObjectName("MutedLabel")
         root.addWidget(self.status_label)
 
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(
-            ["收藏", "狀態", "ID", "物件編號", "物件名稱", "地址", "價格", "格局", "坪數", "標籤", "備註"]
+            ["收藏", "狀態", "ID", "物件編號", "物件名稱", "地址", "價格", "格局", "坪數", "標籤", "備註", "排程狀態"]
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -175,6 +224,7 @@ class PropertiesPage(QWidget):
             self.favorites_only.isChecked(),
         )
         changes_map = self.db.recent_property_changes_map()
+        self.schedule_status_map = self.db.latest_schedule_by_property()
 
         status_filter = self.status_filter.currentText()
         self.rows = []
@@ -194,32 +244,61 @@ class PropertiesPage(QWidget):
         self.table.setRowCount(len(self.rows))
         selected_row = -1
         for row_index, row in enumerate(self.rows):
-            values = [
-                "★" if int(row.get("favorite", 0) or 0) else "",
-                row.get("_badge", ""),
-                row.get("id", ""), row.get("external_id", ""), row.get("title", ""),
-                row.get("address", ""), row.get("price", ""), row.get("layout", ""),
-                row.get("size", ""), row.get("tag", ""), row.get("note", ""),
-            ]
-            for column_index, value in enumerate(values):
-                item = QTableWidgetItem(str(value or ""))
-                if column_index in (0, 1, 2, 3, 6, 7, 8, 9):
-                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                if column_index == 1 and row.get("_badge_kind"):
-                    bg, fg = row["_badge_kind"]
-                    item.setBackground(QColor(bg))
-                    item.setForeground(QColor(fg))
-                self.table.setItem(row_index, column_index, item)
+            self._render_row(row_index, row)
             if row.get("id") == selected_id:
                 selected_row = row_index
         self.table.resizeColumnsToContents()
         self.table.setColumnWidth(4, 280)
         self.table.setColumnWidth(5, 220)
-        self.table.setColumnWidth(10, 300)
+        self.table.setColumnWidth(10, 220)
         if selected_row >= 0:
             self.table.selectRow(selected_row)
         favorites = sum(int(row.get("favorite", 0) or 0) for row in self.rows)
         self.status_label.setText(f"目前顯示 {len(self.rows)} 筆物件，其中 {favorites} 筆收藏")
+
+    def _render_row(self, row_index: int, row: dict) -> None:
+        schedule_status, schedule_kind = _schedule_status_cell(
+            self.schedule_status_map.get(int(row.get("id") or 0))
+        )
+        values = [
+            "★" if int(row.get("favorite", 0) or 0) else "",
+            row.get("_badge", ""),
+            row.get("id", ""), row.get("external_id", ""), row.get("title", ""),
+            row.get("address", ""), row.get("price", ""), row.get("layout", ""),
+            row.get("size", ""), row.get("tag", ""), row.get("note", ""),
+            schedule_status,
+        ]
+        for column_index, value in enumerate(values):
+            item = QTableWidgetItem(str(value or ""))
+            if column_index in (0, 1, 2, 3, 6, 7, 8, 9, 11):
+                item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            if column_index == 1 and row.get("_badge_kind"):
+                bg, fg = row["_badge_kind"]
+                item.setBackground(QColor(bg))
+                item.setForeground(QColor(fg))
+            if column_index == 11:
+                bg, fg = schedule_kind
+                item.setBackground(QColor(bg))
+                item.setForeground(QColor(fg))
+            self.table.setItem(row_index, column_index, item)
+
+    def _refresh_schedule_status_for_property(self, property_id: int) -> None:
+        """只更新單一物件的排程狀態欄，不重新查整張 properties 清單、
+        不重建整個表格——建一筆排程之後不需要 unnecessary full refresh。
+        """
+        self.schedule_status_map = self.db.latest_schedule_by_property()
+        for row_index, row in enumerate(self.rows):
+            if int(row.get("id") or 0) == property_id:
+                schedule_status, schedule_kind = _schedule_status_cell(
+                    self.schedule_status_map.get(property_id)
+                )
+                item = self.table.item(row_index, 11)
+                if item is not None:
+                    item.setText(schedule_status)
+                    bg, fg = schedule_kind
+                    item.setBackground(QColor(bg))
+                    item.setForeground(QColor(fg))
+                break
 
     @staticmethod
     def _status_badge(row: dict, changes_map: dict[int, dict]) -> tuple[str, tuple[str, str] | None]:
@@ -364,3 +443,84 @@ class PropertiesPage(QWidget):
             QMessageBox.warning(self, "沒有網址", "這筆物件沒有原始網頁網址。")
             return
         webbrowser.open(url)
+
+    # ------------------------------------------------------------------
+    # 2026-09-21 UX 重構：物件中心「安排發文」——一個對話框內完成，
+    # 存檔後留在物件中心（不自動跳頁），只更新受影響的那一列。
+    # ------------------------------------------------------------------
+
+    def open_quick_schedule(self) -> None:
+        row = self.selected()
+        if not row:
+            QMessageBox.information(self, "尚未選擇物件", "請先點選一筆物件。")
+            return
+
+        dialog = QuickScheduleDialog(self.db, int(row["id"]), parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        property_id = int(row["id"])
+        self._refresh_schedule_status_for_property(property_id)
+
+        if dialog.trigger_immediate_publish and dialog.created_schedule_id is not None:
+            self._start_immediate_publish(dialog.created_schedule_id, property_id)
+            return
+
+        message = f"已建立排程\n{dialog.scheduled_at_display} 發布"
+        if dialog.delete_at_display:
+            message += f"\n{dialog.delete_at_display} 自動刪除"
+        show_toast(
+            self,
+            message,
+            kind="success",
+            duration_ms=5000,
+            action_text="查看排程",
+            on_action=self._go_to_schedule_center,
+        )
+
+    def _go_to_schedule_center(self) -> None:
+        if callable(self.go_schedule):
+            self.go_schedule()
+
+    def _start_immediate_publish(self, schedule_id: int, property_id: int) -> None:
+        if self.publish_runner is not None:
+            show_toast(self, "已建立排程，但目前已有其他貼文正在發布中，請稍後在排程中心手動發布。", kind="info", duration_ms=4000)
+            return
+
+        row = self.db.get_schedule(schedule_id)
+        if not row:
+            return
+
+        self.db.mark_schedule_publishing(schedule_id)
+        self._refresh_schedule_status_for_property(property_id)
+        self.schedule_btn.setEnabled(False)
+        self.status_label.setText(f"正在發布：{row.get('property_title', '')} ……")
+
+        self.publish_runner = SchedulePublishRunner(self.db, dict(row))
+        self.publish_runner.finished.connect(lambda payload: self._on_immediate_publish_finished(payload, property_id))
+        self.publish_runner.failed.connect(lambda message: self._on_immediate_publish_failed(message, property_id))
+        self.publish_runner.start()
+
+    def _on_immediate_publish_finished(self, payload: dict, property_id: int) -> None:
+        success = bool(payload.get("success"))
+        message = str(payload.get("message", ""))
+        if success:
+            show_toast(
+                self, "✓ 發布成功", kind="success",
+                action_text="查看排程", on_action=self._go_to_schedule_center,
+            )
+        else:
+            show_toast(self, f"發布失敗：{message}", kind="danger", duration_ms=4000)
+        self._finish_immediate_publish(property_id)
+
+    def _on_immediate_publish_failed(self, message: str, property_id: int) -> None:
+        show_toast(self, f"發布發生錯誤：{message}", kind="danger", duration_ms=4000)
+        self._finish_immediate_publish(property_id)
+
+    def _finish_immediate_publish(self, property_id: int) -> None:
+        if self.publish_runner is not None:
+            self.publish_runner.wait_and_cleanup()
+        self.publish_runner = None
+        self.schedule_btn.setEnabled(True)
+        self.status_label.setText("準備完成")
+        self._refresh_schedule_status_for_property(property_id)

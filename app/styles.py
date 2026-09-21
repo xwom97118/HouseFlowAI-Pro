@@ -561,4 +561,28 @@ QToolTip {
     font-weight: 600;
     background: transparent;
 }
+#ToastActionButton {
+    color: #FFFFFF;
+    background: rgba(255, 255, 255, 0.18);
+    border: none;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 700;
+}
+#ToastActionButton:hover {
+    background: rgba(255, 255, 255, 0.30);
+}
+
+#StatusChip {
+    border-radius: 8px;
+    padding: 2px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+#StatusChip[kind="success"] { background: #DCFCE7; color: #15803D; }
+#StatusChip[kind="warning"] { background: #FEF3C7; color: #B45309; }
+#StatusChip[kind="danger"]  { background: #FEE2E2; color: #B91C1C; }
+#StatusChip[kind="info"]    { background: #DBEAFE; color: #1D4ED8; }
+#StatusChip[kind="neutral"] { background: #E5E9F0; color: #526176; }
 """
