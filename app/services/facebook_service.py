@@ -384,7 +384,7 @@ class FacebookService:
 
                 delete_action = opened_menu.get_by_role(
                     "menuitem",
-                    name=re.compile(r"刪除貼文|移到垃圾桶|Delete post|Move to trash"),
+                    name=self._DELETE_MENU_ITEM_PATTERN,
                 )
                 if not self._click_first_visible(delete_action):
                     raise RuntimeError("找不到刪除選項，無法刪除。")
@@ -392,7 +392,7 @@ class FacebookService:
 
                 confirm_button = page.get_by_role(
                     "button",
-                    name=re.compile(r"^刪除$|移到垃圾桶|^Delete$|Move to trash"),
+                    name=self._DELETE_CONFIRM_BUTTON_PATTERN,
                 )
                 if not self._click_first_visible(confirm_button):
                     raise RuntimeError("找不到刪除確認按鈕，無法刪除。")
@@ -696,6 +696,22 @@ class FacebookService:
     _PERMALINK_IS_POST_SHAPE = re.compile(
         r"/posts/|/videos/|story_fbid=|permalink\.php"
     )
+
+    # delete_post() 用的選單／按鈕文字樣式，抽成常數方便測試直接對真實
+    # 觀察到的文字驗證，不必透過完整的 mock 呼叫鏈。
+    #
+    # 2026-09-21：對著 schedule id=7 真實的 /photo/ 永久連結頁面直接讀取
+    # 選單內容後發現，這個頁面（相片檢視器）的刪除選項文字是「刪除
+    # 相片」，不是「刪除貼文」——因為單張相片貼文的 capture 邏輯取得的
+    # 正是 /photo/?fbid=... 這種永久連結，Facebook 在這個檢視器情境下
+    # 把「刪除這張相片」當作刪除整篇貼文的操作（這篇貼文的全部內容就是
+    # 這張相片），跟一般動態消息貼文用的「刪除貼文」是不同措辭。兩種
+    # 都保留，涵蓋 /posts/ 型永久連結跟 /photo/ 型永久連結兩種情境。
+    _DELETE_MENU_ITEM_PATTERN = re.compile(
+        r"刪除貼文|刪除相片|移到垃圾桶|Delete post|Delete photo|Move to trash"
+    )
+    _DELETE_CONFIRM_BUTTON_PATTERN = re.compile(r"^刪除$|移到垃圾桶|^Delete$|Move to trash")
+
     # 貼文永久連結的 ID 現在多半是 pfbid 開頭的英數字 token（例如
     # .../posts/pfbid02t7umeRc7HyxPh6...），不是只有數字，所以這裡除了
     # 舊版純數字樣式，也要接受 pfbid 樣式；抓不到 ID 不影響安全性，

@@ -347,6 +347,24 @@ fake_page, fake_context = build_fake_page_for_delete(REAL_POST_URL, REAL_SCHEDUL
 resultD6 = run_delete(fake_page, fake_context, REAL_POST_URL, expected_content_prefix=REAL_SCHEDULE_CONTENT, expected_post_id="28630627439864864")
 check("TEST D6: no menu opened after click -> refuses rather than guessing", resultD6.get("success") is False)
 
+# ---- TEST D7: the delete-menuitem pattern must match the REAL text observed live on
+# schedule_id=7's /photo/ permalink page ("刪除相片", not "刪除貼文" -- a genuinely
+# different Facebook wording for photo-viewer permalinks vs. normal feed posts) ----
+check(
+    "TEST D7: delete-menuitem pattern matches real '刪除相片' wording (photo permalink page)",
+    bool(FacebookService._DELETE_MENU_ITEM_PATTERN.search("刪除相片")),
+)
+check(
+    "TEST D7: delete-menuitem pattern still matches '刪除貼文' wording (normal feed post)",
+    bool(FacebookService._DELETE_MENU_ITEM_PATTERN.search("刪除貼文")),
+)
+# 同一個選單裡出現的其他真實項目（來自對 schedule id=7 的真實讀取）不應該被誤判成刪除選項。
+for unrelated_item in ["編輯貼文分享對象", "變更替代文字", "編輯地點", "關閉這則貼文的通知", "向左旋轉", "下載", "設定為大頭貼照"]:
+    check(
+        f"TEST D7: unrelated real menu item {unrelated_item!r} does not match delete pattern",
+        not FacebookService._DELETE_MENU_ITEM_PATTERN.search(unrelated_item),
+    )
+
 
 print()
 if failures:
