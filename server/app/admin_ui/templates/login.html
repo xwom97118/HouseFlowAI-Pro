@@ -1,0 +1,18 @@
+{% extends "_base.html" %}
+{% block title %}登入 - HouseFlow Admin{% endblock %}
+{% block content %}
+<div class="panel" style="max-width:360px;margin:60px auto;">
+  <h2>Admin 登入</h2>
+  <form method="post" action="/admin/login?next={{ next }}">
+    <div class="field">
+      <label>使用者名稱</label>
+      <input type="text" name="username" required autofocus>
+    </div>
+    <div class="field">
+      <label>密碼</label>
+      <input type="password" name="password" required>
+    </div>
+    <button type="submit" style="width:100%;">登入</button>
+  </form>
+</div>
+{% endblock %}

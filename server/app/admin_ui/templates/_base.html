@@ -1,0 +1,98 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}HouseFlow Admin{% endblock %}</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #161d2e; --panel-2: #1c2438; --border: #2a334a;
+    --text: #e6e9f2; --muted: #8b93a7; --accent: #4f7cff; --accent-2: #3a63d8;
+    --ok: #2fbf71; --warn: #e0a63a; --danger: #e0533a; --radius: 10px;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Microsoft JhengHei", sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px; line-height: 1.5;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 24px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .topbar .brand { font-weight: 700; font-size: 16px; }
+  .topbar .brand span { color: var(--muted); font-weight: 400; margin-left: 8px; }
+  .topbar nav a { margin-right: 16px; color: var(--muted); }
+  .topbar nav a.active, .topbar nav a:hover { color: var(--text); }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; margin-bottom: 20px; }
+  .panel h2 { margin-top: 0; font-size: 15px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .04em; }
+  .grid-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }
+  .stat-card { background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; }
+  .stat-card .num { font-size: 26px; font-weight: 700; }
+  .stat-card .label { color: var(--muted); font-size: 12px; margin-top: 4px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--border); font-size: 13px; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; text-transform: uppercase; }
+  tr:hover td { background: rgba(255,255,255,0.02); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .badge-trial { background: rgba(79,124,255,.18); color: #8fb0ff; }
+  .badge-active { background: rgba(47,191,113,.18); color: #6fe0a6; }
+  .badge-expired { background: rgba(224,166,58,.18); color: #f0c777; }
+  .badge-suspended { background: rgba(224,83,58,.18); color: #f29080; }
+  .badge-revoked { background: rgba(140,140,140,.2); color: #b8b8b8; }
+  .badge-early { background: rgba(224,166,58,.25); color: #ffd98a; }
+  input[type=text], input[type=password], input[type=number], select {
+    background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 8px 10px; font-size: 13px; width: 100%;
+  }
+  label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+  .field { margin-bottom: 14px; }
+  button, .btn {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover, .btn:hover { background: var(--accent-2); text-decoration: none; }
+  button.secondary, .btn.secondary { background: var(--panel-2); border: 1px solid var(--border); color: var(--text); }
+  button.danger, .btn.danger { background: var(--danger); }
+  button.warn, .btn.warn { background: var(--warn); color: #1a1305; }
+  .btn-row { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .flash { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 13px; }
+  .flash-ok { background: rgba(47,191,113,.15); border: 1px solid rgba(47,191,113,.4); color: #9be8bf; }
+  .flash-error { background: rgba(224,83,58,.15); border: 1px solid rgba(224,83,58,.4); color: #f2a494; }
+  .mono { font-family: "SFMono-Regular", Consolas, monospace; }
+  .muted { color: var(--muted); }
+  .key-display {
+    background: var(--panel-2); border: 1px dashed var(--accent); border-radius: 8px;
+    padding: 16px; font-size: 18px; font-family: Consolas, monospace; letter-spacing: 1px;
+    margin: 12px 0; user-select: all;
+  }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand">HouseFlow Admin <span>License Control Plane</span></div>
+  {% if admin %}
+  <nav>
+    <a href="/admin/" class="{{ 'active' if active=='dashboard' else '' }}">Dashboard</a>
+    <a href="/admin/licenses" class="{{ 'active' if active=='licenses' else '' }}">Licenses</a>
+    <a href="/admin/licenses/new" class="{{ 'active' if active=='new' else '' }}">+ New License</a>
+    <a href="/admin/audit" class="{{ 'active' if active=='audit' else '' }}">Audit Log</a>
+    <a href="/admin/settings" class="{{ 'active' if active=='settings' else '' }}">Settings</a>
+    <span class="muted">{{ admin.username }}</span>
+    &nbsp;&nbsp;<a href="/admin/logout">Logout</a>
+  </nav>
+  {% endif %}
+</div>
+<div class="container">
+  {% if request.query_params.get('msg') %}
+  <div class="flash flash-ok">{{ request.query_params.get('msg') }}</div>
+  {% endif %}
+  {% if request.query_params.get('err') %}
+  <div class="flash flash-error">{{ request.query_params.get('err') }}</div>
+  {% endif %}
+  {% block content %}{% endblock %}
+</div>
+</body>
+</html>

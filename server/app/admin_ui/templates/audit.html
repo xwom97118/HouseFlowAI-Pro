@@ -1,0 +1,24 @@
+{% extends "_base.html" %}
+{% block title %}Audit Log - HouseFlow Admin{% endblock %}
+{% block content %}
+<div class="panel">
+  <h2>最近的 Admin 操作紀錄</h2>
+  <table>
+    <thead><tr><th>時間</th><th>Admin</th><th>Action</th><th>License</th><th>Old</th><th>New</th></tr></thead>
+    <tbody>
+      {% for entry in entries %}
+      <tr>
+        <td>{{ entry.created_at }}</td>
+        <td>{{ entry.admin_username }}</td>
+        <td>{{ entry.action }}</td>
+        <td>{% if entry.license_id %}<a href="/admin/licenses/{{ entry.license_id }}">{{ entry.license_id[:8] }}…</a>{% else %}—{% endif %}</td>
+        <td class="mono muted">{{ entry.old_value or '—' }}</td>
+        <td class="mono muted">{{ entry.new_value or '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="6" class="muted">尚無紀錄。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 
 from PySide6.QtWidgets import (
@@ -22,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from app.services import brand_profile
 from app.services.database import Database
-from app.services.license import MockLicenseProvider
+from app.services.license import DEFAULT_BASE_URL, HTTPLicenseProvider
 from app.widgets.common import SectionTitle
 from app.widgets.license_widgets import LicenseInfoPanel
 
@@ -495,7 +496,16 @@ class SettingsPage(QWidget):
         layout = QVBoxLayout(content)
         layout.setContentsMargins(0, 12, 12, 0)
 
-        license_service = MockLicenseProvider(self.db.get_setting, self.db.set_setting)
+        # 2026-09-22 Phase 2：正式 provider 改成 HTTPLicenseProvider，
+        # 打本機／未來正式的 License Server（見
+        # app/services/license/http_provider.py）；MockLicenseProvider
+        # 只留給測試使用（規格第 20 節）。base_url 可用環境變數覆蓋，
+        # 沒有真正的 License Server 在跑時，get_current_license() 純讀
+        # 本機快取，不會發出任何網路請求——只有使用者真的點擊「開始
+        # 試用／輸入 License Key」或到期需要重新驗證時才會嘗試連線，
+        # 連不上就顯示清楚的錯誤訊息，不會讓 Settings 頁卡住或崩潰。
+        base_url = os.environ.get("HOUSEFLOW_LICENSE_SERVER_URL", "").strip() or DEFAULT_BASE_URL
+        license_service = HTTPLicenseProvider(self.db.get_setting, self.db.set_setting, base_url=base_url)
         self.license_panel = LicenseInfoPanel(license_service, self.db.get_setting, self.db.set_setting)
         layout.addWidget(self.license_panel)
         layout.addStretch()

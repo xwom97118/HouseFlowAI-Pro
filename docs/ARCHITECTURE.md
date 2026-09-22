@@ -8,12 +8,25 @@
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│  Desktop App (PySide6)                                   │
+│  HouseFlow Desktop (PySide6)                              │
 │  app/main_window.py, app/pages/*, app/widgets/*           │
+│                     │                                      │
+│                     │ HTTPS（Phase 2 本機開發：HTTP）         │
+│                     ▼                                      │
+│           License Server (FastAPI)  ◄──────┐               │
+│           server/app/api/license_routes.py │               │
+│                     │                       │               │
+│                     ▼                       │               │
+│              License DB (SQLite→PostgreSQL) │               │
+│                     ▲                       │               │
+│                     │                       │               │
+│           HouseFlow Admin (FastAPI+Jinja2) ─┘               │
+│           server/app/admin_ui/                             │
 ├─────────────────────────────────────────────────────────┤
-│  Local Data                                                │
+│  Local Data（永遠留在 Desktop，不上傳到 License Server）      │
 │  app/services/database.py (SQLite)                        │
 │  %LOCALAPPDATA%\HouseFlow\ (production) / data/ (dev)      │
+│  Property / CRM / Facebook Session / 排程內容 / 照片          │
 ├─────────────────────────────────────────────────────────┤
 │  Domain Services（跟 UI、跟特定後端都解耦）                  │
 │  - app/services/license/        License 網域模型 + 邏輯      │
@@ -22,15 +35,18 @@
 │  - app/services/backup_service.py  Backup/Restore           │
 │  - app/services/updater_service.py Update 狀態機骨架          │
 │  - app/services/facebook_service.py 【受保護，見下】          │
-├─────────────────────────────────────────────────────────┤
-│  未來：License Cloud + Admin（V1 只有介面，沒有真正的伺服器）  │
 └─────────────────────────────────────────────────────────┘
 ```
 
+Property／CRM／Facebook 相關資料永遠只存在「HouseFlow Desktop」這一層
+的 Local Data，License Server 的資料庫完全沒有對應的表可以存放這些
+資料（見 [LICENSE_SECURITY.md](LICENSE_SECURITY.md) 第 9 節）。
+
 設計原則：**Desktop 端只依賴介面（ABC），不直接依賴任何特定後端
-實作**。License、Property Source、Update 都是這個模式——現在只有
-本機/mock 實作，之後要換成真正打 Cloud API 的版本時，UI 層完全不用
-改，只要在依賴注入的地方換一個實作。
+實作**。License、Property Source、Update 都是這個模式——License 這一
+層現在已經有真正可以打的 HTTP 實作（見第 3 節），Property
+Source/Update 仍然只有本機/mock 實作，之後要換成真正的版本時，UI 層
+完全不用改，只要在依賴注入的地方換一個實作。
 
 ## 2. Facebook Pipeline（受保護）
 
@@ -48,33 +64,50 @@ Property Source Connector、Migration、Backup、Updater）都是**加法**
 (2) 先用 mock/temp 資料驗證，(3) 絕不放寬 unique-target 刪除安全
 機制、絕不用猜測辨識 Facebook 貼文身分。
 
-## 3. License 網域層
+## 3. License 網域層 + License Server（Phase 2）
 
 ```
 app/services/license/
-├── models.py       License / TrialState / DeviceBinding /
-│                   LicenseCheckResult dataclass，LicenseStatus 等 Enum
-├── evaluation.py    evaluate_license() —— 純函式，算「現在能不能用」
-│                    （trial / active / expired / suspended /
-│                    offline grace / clock-tamper），不做任何 I/O
-├── fingerprint.py   compute_device_fingerprint() —— 本機持久化隨機 UUID
-├── service.py       LicenseService(ABC) 介面 + 例外類別
-└── mock_provider.py MockLicenseProvider —— 本輪唯一接進 Desktop 的實作
+├── models.py         License / TrialState / DeviceBinding /
+│                     LicenseCheckResult dataclass，LicenseStatus 等 Enum
+│                     （Phase 2 新增 LicenseStatus.REVOKED、
+│                     LicenseCheckResult.latest_version/
+│                     minimum_supported_version）
+├── evaluation.py      evaluate_license() —— 純函式，算「現在能不能用」
+│                      （trial / active / expired / suspended /
+│                      offline grace / clock-tamper），不做任何 I/O
+├── fingerprint.py      compute_device_fingerprint() —— 本機持久化隨機 UUID
+├── service.py          LicenseService(ABC) 介面 + 例外類別
+├── mock_provider.py     MockLicenseProvider —— 只給測試使用
+└── http_provider.py      HTTPLicenseProvider —— Phase 2 起，Settings
+                           頁「授權資訊」實際使用的 provider（規格第 20 節）
 ```
 
-`MockLicenseProvider` 把狀態存成一個 JSON blob，寫在既有的
-`app_settings` table（透過呼叫端注入的 `db.get_setting`/
-`db.set_setting`，不直接 import `Database`）。UI 端（
-`app/widgets/license_widgets.py` 的 `LicenseInfoPanel` /
-`ActivationDialog`，掛載在 Settings 頁「授權資訊」分頁）只認
-`LicenseService` 這個介面。
+`HTTPLicenseProvider`（`app/services/license/http_provider.py`）是
+Desktop 端**正式**的 `LicenseService` 實作，用 `httpx` 呼叫本機／未來
+正式的 License Server；`MockLicenseProvider` 改為只留給測試使用。
+兩者都把狀態快取／讀寫在同一組 `app_settings` key
+（`license_state_json` / `license_last_verified_at` /
+`license_high_water_mark`），所以 UI 層（`LicenseInfoPanel` /
+`ActivationDialog`）完全不需要知道現在用的是哪一個 provider。
 
-未來真正的 Cloud provider 只需要：
-1. 實作 `LicenseService` 的四個抽象方法，內部改成打 HTTPS API。
-2. `check_license()` 傳回的 `last_verified_at` 必須是**伺服器回應的
-   時間戳記**，不能是本機時間——這樣才能真正防止使用者自己調時鐘
-   繞過驗證（見 `evaluation.py` 的 docstring）。
-3. Desktop 端（`SettingsPage`、未來的 First Run Wizard）不需要改一行。
+`HTTPLicenseProvider.check_license()` 的離線容忍設計：
+
+1. 先嘗試真的打一次 `POST /api/license/verify`。
+2. 連得上：用 server 回傳的權威狀態更新本機快取，直接回傳。
+3. 連不上（`httpx` 連線/逾時例外）：退回讀本機快取，呼叫
+   `evaluate_license()`（Phase 1 就有、經過測試的純函式）計算離線
+   寬限期／時鐘回撥。
+
+`get_current_license()` 完全不發任何網路請求（純讀本機快取）——這代表
+沒有 License Server 在跑時，`SettingsPage` 一樣可以正常建構、正常
+顯示「尚未開始試用」，不會卡住或崩潰；只有使用者真的點擊「開始試用／
+輸入 License Key」，或到期需要重新驗證時，才會嘗試連線，連不上就顯示
+清楚的錯誤訊息。
+
+License Server 本身見 [LICENSE_SERVER.md](LICENSE_SERVER.md)、
+[ADMIN_CONTROL_PLANE.md](ADMIN_CONTROL_PLANE.md)、
+[LICENSE_SECURITY.md](LICENSE_SECURITY.md)。
 
 ## 4. Property Source Connector
 

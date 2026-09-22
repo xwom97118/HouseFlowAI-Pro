@@ -1,0 +1,37 @@
+{% extends "_base.html" %}
+{% block title %}Settings - HouseFlow Admin{% endblock %}
+{% block content %}
+<div class="panel" style="max-width:480px;">
+  <h2>全域商業設定</h2>
+  <form method="post" action="/admin/settings">
+    <div class="field">
+      <label>目前月費（NT$）</label>
+      <input type="number" name="current_monthly_price" value="{{ settings.current_monthly_price }}" min="0" required>
+    </div>
+    <div class="field">
+      <label>幣別</label>
+      <input type="text" name="currency" value="{{ settings.currency }}" required>
+    </div>
+    <div class="field">
+      <label>試用天數</label>
+      <input type="number" name="trial_days" value="{{ settings.trial_days }}" min="1" required>
+    </div>
+    <div class="field">
+      <label>離線寬限天數</label>
+      <input type="number" name="offline_grace_days" value="{{ settings.offline_grace_days }}" min="1" required>
+    </div>
+    <div class="field">
+      <label>最新版本</label>
+      <input type="text" name="latest_version" value="{{ settings.latest_version }}" required>
+    </div>
+    <div class="field">
+      <label>最低支援版本</label>
+      <input type="text" name="minimum_supported_version" value="{{ settings.minimum_supported_version }}" required>
+    </div>
+    <button type="submit">儲存設定</button>
+  </form>
+  <p class="muted" style="margin-top:14px;">
+    已經是 Early Bird 的 License 不受「目前月費」變動影響，永久維持建立當下鎖定的價格。
+  </p>
+</div>
+{% endblock %}

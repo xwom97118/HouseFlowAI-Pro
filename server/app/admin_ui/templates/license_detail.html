@@ -1,0 +1,108 @@
+{% extends "_base.html" %}
+{% block title %}License {{ license.license_id[:8] }} - HouseFlow Admin{% endblock %}
+{% block content %}
+
+<div class="panel">
+  <h2>License 詳細資料</h2>
+  <table>
+    <tr><td class="muted">License ID</td><td class="mono">{{ license.license_id }}</td></tr>
+    <tr><td class="muted">License Key（末四碼）</td><td class="mono">****-****-****-{{ license.license_key_last4 }}</td></tr>
+    <tr><td class="muted">Plan</td><td>{{ license.plan }}</td></tr>
+    <tr><td class="muted">Status（實際儲存）</td><td><span class="badge badge-{{ license.status }}">{{ license.status }}</span></td></tr>
+    <tr><td class="muted">Status（目前有效狀態）</td><td><span class="badge badge-{{ effective_status }}">{{ effective_status }}</span>{% if effective_status != license.status %}<span class="muted"> （已過期，尚未由 Admin 手動標記）</span>{% endif %}</td></tr>
+    <tr><td class="muted">Early Bird</td><td>{{ '是（鎖定 ' + license.currency + ' ' + (license.locked_price|string) + '）' if license.is_early_bird else '否' }}</td></tr>
+    <tr><td class="muted">Device Limit</td><td>{{ license.device_limit }}</td></tr>
+    <tr><td class="muted">Trial 期間</td><td>{{ license.trial_started_at }} ～ {{ license.trial_ends_at }}</td></tr>
+    <tr><td class="muted">Activated At</td><td>{{ license.activated_at or '—' }}</td></tr>
+    <tr><td class="muted">Expires At</td><td>{{ license.expires_at or '—' }}</td></tr>
+    <tr><td class="muted">Created At</td><td>{{ license.created_at }}</td></tr>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>操作</h2>
+
+  <form method="post" action="/admin/licenses/{{ license.license_id }}/extend" style="display:inline-block;margin-right:8px;">
+    <input type="hidden" name="days" value="30"><button type="submit">+30 天</button>
+  </form>
+  <form method="post" action="/admin/licenses/{{ license.license_id }}/extend" style="display:inline-block;margin-right:8px;">
+    <input type="hidden" name="days" value="90"><button type="submit">+90 天</button>
+  </form>
+  <form method="post" action="/admin/licenses/{{ license.license_id }}/extend" style="display:inline-flex;gap:6px;align-items:center;margin-right:8px;">
+    <input type="number" name="days" placeholder="天數" style="width:90px;" required>
+    <button type="submit" class="secondary">自訂延長</button>
+  </form>
+
+  <div class="btn-row">
+    {% if license.status != 'suspended' %}
+    <form method="post" action="/admin/licenses/{{ license.license_id }}/suspend"><button type="submit" class="warn">Suspend</button></form>
+    {% else %}
+    <form method="post" action="/admin/licenses/{{ license.license_id }}/resume"><button type="submit">Resume</button></form>
+    {% endif %}
+
+    {% if license.status != 'revoked' %}
+    <form method="post" action="/admin/licenses/{{ license.license_id }}/revoke" onsubmit="return confirm('確定要撤銷這組 License 嗎？此操作無法復原。');"><button type="submit" class="danger">Revoke</button></form>
+    {% endif %}
+
+    {% if license.is_early_bird %}
+    <form method="post" action="/admin/licenses/{{ license.license_id }}/early-bird"><input type="hidden" name="enabled" value="0"><button type="submit" class="secondary">取消 Early Bird</button></form>
+    {% else %}
+    <form method="post" action="/admin/licenses/{{ license.license_id }}/early-bird"><input type="hidden" name="enabled" value="1"><button type="submit" class="secondary">設為 Early Bird</button></form>
+    {% endif %}
+  </div>
+
+  <div class="field" style="max-width:320px;margin-top:16px;">
+    <label>直接設定到期日（YYYY-MM-DD）</label>
+    <form method="post" action="/admin/licenses/{{ license.license_id }}/set-expiration" style="display:flex;gap:8px;">
+      <input type="text" name="expires_at" placeholder="2026-12-31">
+      <button type="submit" class="secondary">設定</button>
+    </form>
+  </div>
+</div>
+
+<div class="panel">
+  <h2>裝置</h2>
+  <table>
+    <thead><tr><th>Device</th><th>Status</th><th>First Activated</th><th>Last Verified</th><th></th></tr></thead>
+    <tbody>
+      {% for device in devices %}
+      <tr>
+        <td>{{ device.device_name or '（未命名）' }}</td>
+        <td>{{ device.status }}</td>
+        <td>{{ device.first_activated_at }}</td>
+        <td>{{ device.last_verified_at }}</td>
+        <td>
+          {% if device.status == 'active' %}
+          <form method="post" action="/admin/licenses/{{ license.license_id }}/devices/{{ device.device_id }}/deactivate">
+            <button type="submit" class="secondary">解除綁定</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">尚未有任何裝置啟用這組 License。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <h2>此 License 的 Audit Log</h2>
+  <table>
+    <thead><tr><th>時間</th><th>Admin</th><th>Action</th><th>Old</th><th>New</th></tr></thead>
+    <tbody>
+      {% for entry in audit_entries %}
+      <tr>
+        <td>{{ entry.created_at }}</td>
+        <td>{{ entry.admin_username }}</td>
+        <td>{{ entry.action }}</td>
+        <td class="mono muted">{{ entry.old_value or '—' }}</td>
+        <td class="mono muted">{{ entry.new_value or '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="5" class="muted">尚無紀錄。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

@@ -26,6 +26,12 @@ class LicenseStatus(str, Enum):
     ACTIVE = "active"
     EXPIRED = "expired"
     SUSPENDED = "suspended"
+    # 2026-09-22 Phase 2（規格第 4、24 節）：License Server 端多了
+    # revoked 這個狀態（Admin 主動撤銷，永久性、比 suspended 更重）。
+    # Phase 1 的 evaluate_license()／MockLicenseProvider 從來不會產生
+    # 這個狀態（本機 mock 沒有「撤銷」概念），只有 HTTPLicenseProvider
+    # 從真正的 License Server 收到 status="revoked" 時才會用到。
+    REVOKED = "revoked"
 
 
 class DeviceStatus(str, Enum):
@@ -107,9 +113,29 @@ class LicenseCheckResult:
     is_offline_grace: bool = False
     offline_days_remaining: int | None = None
 
+    # 2026-09-22 Phase 2（規格第 25 節）：只有 HTTPLicenseProvider 真的
+    # 連上 License Server 時才會填這兩個值（來自 ProductSettings，不是
+    # Desktop 寫死）；MockLicenseProvider／離線 fallback 都不知道版本
+    # 資訊，維持 None，UI 端看到 None 就不顯示版本相關訊息。
+    latest_version: str | None = None
+    minimum_supported_version: str | None = None
+
     @classmethod
-    def blocked(cls, status: LicenseStatus, message: str) -> "LicenseCheckResult":
-        return cls(can_use_app=False, effective_status=status, message=message, requires_reactivation=True)
+    def blocked(
+        cls,
+        status: LicenseStatus,
+        message: str,
+        latest_version: str | None = None,
+        minimum_supported_version: str | None = None,
+    ) -> "LicenseCheckResult":
+        return cls(
+            can_use_app=False,
+            effective_status=status,
+            message=message,
+            requires_reactivation=True,
+            latest_version=latest_version,
+            minimum_supported_version=minimum_supported_version,
+        )
 
     @classmethod
     def allowed(
@@ -119,6 +145,8 @@ class LicenseCheckResult:
         days_remaining: int | None = None,
         is_offline_grace: bool = False,
         offline_days_remaining: int | None = None,
+        latest_version: str | None = None,
+        minimum_supported_version: str | None = None,
     ) -> "LicenseCheckResult":
         return cls(
             can_use_app=True,
@@ -127,6 +155,8 @@ class LicenseCheckResult:
             days_remaining=days_remaining,
             is_offline_grace=is_offline_grace,
             offline_days_remaining=offline_days_remaining,
+            latest_version=latest_version,
+            minimum_supported_version=minimum_supported_version,
         )
 
 

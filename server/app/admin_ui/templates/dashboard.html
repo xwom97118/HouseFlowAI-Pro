@@ -1,0 +1,23 @@
+{% extends "_base.html" %}
+{% block title %}Dashboard - HouseFlow Admin{% endblock %}
+{% block content %}
+<div class="panel">
+  <h2>License 總覽</h2>
+  <div class="grid-cards">
+    <div class="stat-card"><div class="num">{{ counts.total }}</div><div class="label">總 License</div></div>
+    <div class="stat-card"><div class="num">{{ counts.active }}</div><div class="label">Active</div></div>
+    <div class="stat-card"><div class="num">{{ counts.trial }}</div><div class="label">Trial</div></div>
+    <div class="stat-card"><div class="num">{{ counts.expiring_soon }}</div><div class="label">Expiring Soon (7d)</div></div>
+    <div class="stat-card"><div class="num">{{ counts.expired }}</div><div class="label">Expired</div></div>
+    <div class="stat-card"><div class="num">{{ counts.suspended }}</div><div class="label">Suspended</div></div>
+  </div>
+</div>
+<div class="panel">
+  <h2>快速操作</h2>
+  <div class="btn-row">
+    <a class="btn" href="/admin/licenses/new">+ 建立新 License</a>
+    <a class="btn secondary" href="/admin/licenses">查看所有 License</a>
+    <a class="btn secondary" href="/admin/audit">查看 Audit Log</a>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,51 @@
+{% extends "_base.html" %}
+{% block title %}Licenses - HouseFlow Admin{% endblock %}
+{% block content %}
+<div class="panel">
+  <h2>搜尋</h2>
+  <form method="get" action="/admin/licenses" style="display:flex;gap:10px;align-items:flex-end;">
+    <div class="field" style="flex:1;margin-bottom:0;">
+      <label>License ID / 末四碼 / Device 名稱</label>
+      <input type="text" name="q" value="{{ query }}" placeholder="搜尋...">
+    </div>
+    <div class="field" style="width:160px;margin-bottom:0;">
+      <label>狀態</label>
+      <select name="status">
+        <option value="" {{ 'selected' if not status_filter }}>全部</option>
+        {% for s in ['trial','active','expired','suspended','revoked'] %}
+        <option value="{{ s }}" {{ 'selected' if status_filter==s }}>{{ s }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <button type="submit">搜尋</button>
+  </form>
+</div>
+
+<div class="panel">
+  <h2>License 清單（{{ licenses|length }}）</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>License ID</th><th>Plan</th><th>Status</th><th>Early Bird</th>
+        <th>Price</th><th>Expires</th><th>Device</th><th>Last Verified</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in licenses %}
+      <tr onclick="window.location='/admin/licenses/{{ row.license.license_id }}'" style="cursor:pointer;">
+        <td class="mono">{{ row.license.license_id[:8] }}…</td>
+        <td>{{ row.license.plan }}</td>
+        <td><span class="badge badge-{{ row.effective_status }}">{{ row.effective_status }}</span></td>
+        <td>{% if row.license.is_early_bird %}<span class="badge badge-early">早鳥 {{ row.license.locked_price }}</span>{% else %}—{% endif %}</td>
+        <td>{{ row.license.currency }} {{ row.effective_price }}</td>
+        <td>{{ row.license.expires_at.strftime('%Y-%m-%d') if row.license.expires_at else (row.license.trial_ends_at.strftime('%Y-%m-%d') if row.license.trial_ends_at else '—') }}</td>
+        <td>{{ row.device_count }} 台</td>
+        <td>{{ row.last_verified_at.strftime('%Y-%m-%d %H:%M') if row.last_verified_at else '—' }}</td>
+      </tr>
+      {% else %}
+      <tr><td colspan="8" class="muted">沒有符合條件的 License。</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}

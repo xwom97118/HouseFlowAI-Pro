@@ -1,0 +1,41 @@
+{% extends "_base.html" %}
+{% block title %}建立 License - HouseFlow Admin{% endblock %}
+{% block content %}
+
+{% if created_key %}
+<div class="panel">
+  <h2>建立成功</h2>
+  <p>License Key 只會完整顯示這一次，請立即複製給客戶。之後系統只保留末四碼與 hash，無法再查看完整原始 Key——如果遺失，請建立一組新的 License。</p>
+  <div class="key-display" id="key-text">{{ created_key }}</div>
+  <button type="button" onclick="navigator.clipboard.writeText(document.getElementById('key-text').innerText)">Copy License Key</button>
+  <div class="btn-row">
+    <a class="btn secondary" href="/admin/licenses/{{ created_license_id }}">查看這組 License</a>
+    <a class="btn secondary" href="/admin/licenses/new">再建立一組</a>
+  </div>
+</div>
+{% else %}
+<div class="panel" style="max-width:480px;">
+  <h2>建立新 License</h2>
+  <form method="post" action="/admin/licenses/new">
+    <div class="field">
+      <label>Plan</label>
+      <select name="plan">
+        <option value="professional">Professional</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Duration（天）</label>
+      <input type="number" name="duration_days" value="30" min="1" required>
+    </div>
+    <div class="field">
+      <label>Device Limit</label>
+      <input type="number" name="device_limit" value="1" min="1" required>
+    </div>
+    <div class="field">
+      <label><input type="checkbox" name="is_early_bird" value="1" style="width:auto;"> Early Bird（永久鎖定目前月費）</label>
+    </div>
+    <button type="submit">建立 License</button>
+  </form>
+</div>
+{% endif %}
+{% endblock %}

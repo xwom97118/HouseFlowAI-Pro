@@ -32,6 +32,8 @@ from app.services.license import (
     compute_device_fingerprint,
 )
 from app.services.license.fingerprint import current_device_name
+from app.services.updater_service import is_newer_version
+from app.version import APP_VERSION
 from app.widgets.common import SectionTitle
 
 
@@ -63,6 +65,10 @@ class LicenseInfoPanel(QWidget):
         self.message_label = QLabel("")
         self.message_label.setWordWrap(True)
         self.message_label.setObjectName("MutedLabel")
+        self.version_label = QLabel("")
+        self.version_label.setWordWrap(True)
+        self.version_label.setObjectName("MutedLabel")
+        self.version_label.setVisible(False)
 
         form.addRow("方案：", self.plan_label)
         form.addRow("狀態：", self.status_label)
@@ -72,6 +78,7 @@ class LicenseInfoPanel(QWidget):
         form.addRow("最後驗證時間：", self.last_verified_label)
         root.addLayout(form)
         root.addWidget(self.message_label)
+        root.addWidget(self.version_label)
 
         button_row = QHBoxLayout()
         self.activate_button = QPushButton("開始試用／輸入 License Key")
@@ -117,6 +124,7 @@ class LicenseInfoPanel(QWidget):
             LicenseStatus.ACTIVE: "使用中",
             LicenseStatus.EXPIRED: "已到期",
             LicenseStatus.SUSPENDED: "已停權",
+            LicenseStatus.REVOKED: "已撤銷",
         }.get(result.effective_status, result.effective_status.value)
         if result.is_offline_grace:
             status_text += "（離線寬限期）"
@@ -126,6 +134,7 @@ class LicenseInfoPanel(QWidget):
         self.remaining_label.setText(f"{result.days_remaining} 天" if result.days_remaining is not None else "—")
         self.device_label.setText(current_device_name())
         self.last_verified_label.setText(self.get_setting("license_last_verified_at", "") or "—")
+        self._update_version_label(result)
         self.message_label.setText(result.message)
         self.activate_button.setText("續訂／重新輸入 License Key" if result.effective_status != LicenseStatus.TRIAL else "輸入 License Key")
 
@@ -133,6 +142,27 @@ class LicenseInfoPanel(QWidget):
         dialog = ActivationDialog(self.license_service, self.get_setting, self.set_setting, parent=self)
         dialog.exec()
         self.refresh()
+
+    def _update_version_label(self, result) -> None:
+        """規格第 25 節：verify 回應帶 latest_version/
+        minimum_supported_version 時才顯示版本提示；MockLicenseProvider
+        或離線 fallback 沒有這兩個欄位（None）時完全不顯示，不影響
+        既有畫面。這裡只顯示提示文字，不做任何真正的下載或功能鎖定
+        ——那是 Updater 之後才會做的事（規格第 34 節：這一輪不做 auto
+        updater download）。
+        """
+        messages = []
+        if result.minimum_supported_version and is_newer_version(result.minimum_supported_version, APP_VERSION):
+            messages.append(f"目前版本（{APP_VERSION}）低於最低支援版本（{result.minimum_supported_version}），需要更新後才能繼續使用。")
+        elif result.latest_version and is_newer_version(result.latest_version, APP_VERSION):
+            messages.append(f"有新版本可用：{result.latest_version}（目前版本 {APP_VERSION}）。")
+
+        if messages:
+            self.version_label.setText(" ".join(messages))
+            self.version_label.setVisible(True)
+        else:
+            self.version_label.setText("")
+            self.version_label.setVisible(False)
 
 
 class ActivationDialog(QDialog):
