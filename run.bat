@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-title HouseFlow AI Professional
+title HouseFlow
 
 if exist ".venv\Scripts\python.exe" goto run
 

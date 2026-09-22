@@ -208,7 +208,16 @@ class DashboardPage(QWidget):
         metrics.setHorizontalSpacing(14)
         metrics.setVerticalSpacing(14)
 
-        self.cards = {
+        # 2026-09-22 產品化 Phase 1.1：CRM 已經從 V1 導覽隱藏（見
+        # main_window.py 的 V1_HIDDEN_NAV_KEYS），Dashboard 不應該再顯示
+        # 一張使用者點不到入口的「CRM 客戶」卡片。這裡沿用跟導覽列同樣
+        # 的「過濾清單」寫法，之後要重新開放 CRM 時，把 "contacts" 從
+        # V1_HIDDEN_METRIC_KEYS 移除即可，不需要改動其他邏輯——
+        # self.cards.items() 的 refresh 迴圈本來就是通用的，不會因為
+        # 少了 "contacts" 這個 key 而出錯。
+        V1_HIDDEN_METRIC_KEYS = {"contacts"}
+
+        all_cards = {
             "properties": DashboardMetricCard(
                 "🏠",
                 "全部物件",
@@ -229,6 +238,11 @@ class DashboardPage(QWidget):
                 "CRM 客戶",
                 "買方與屋主",
             ),
+        }
+        self.cards = {
+            key: card
+            for key, card in all_cards.items()
+            if key not in V1_HIDDEN_METRIC_KEYS
         }
 
         for index, card in enumerate(

@@ -93,6 +93,29 @@ def test_navigate_to_hidden_page_does_not_crash() -> None:
         window.close()
 
 
+def test_dashboard_hides_crm_metric_card() -> None:
+    """規格：CRM 已從 V1 導覽隱藏，Dashboard 不應該再顯示一張使用者
+    點不到入口的「CRM 客戶」卡片（2026-09-22 Phase 1.1）。"""
+    window = MainWindow()
+    try:
+        dashboard_page = window.pages["dashboard"]
+        assert "contacts" not in dashboard_page.cards
+        assert "properties" in dashboard_page.cards
+        assert "favorites" in dashboard_page.cards
+        assert "drafts" in dashboard_page.cards
+    finally:
+        window.close()
+
+
+def test_dashboard_refresh_does_not_crash_without_crm_card() -> None:
+    window = MainWindow()
+    try:
+        dashboard_page = window.pages["dashboard"]
+        dashboard_page.refresh()  # 不應該因為少了 "contacts" key 而崩潰
+    finally:
+        window.close()
+
+
 def test_settings_page_has_license_tab() -> None:
     window = MainWindow()
     try:

@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from app.services import brand_profile
 from app.services.ai_service import AIService
 from app.services.database import Database
 from app.widgets.common import SectionTitle
@@ -247,6 +248,7 @@ class AICenterPage(QWidget):
                     platform,
                     style,
                     extra,
+                    brand_profile=brand_profile.load_profile(self.db),
                 )
 
                 self.editors[platform].setPlainText(content)
@@ -302,6 +304,7 @@ class AICenterPage(QWidget):
                 platform,
                 style,
                 extra,
+                brand_profile=brand_profile.load_profile(self.db),
             )
 
             self.editors[platform].setPlainText(content)

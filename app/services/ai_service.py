@@ -3,9 +3,14 @@ from __future__ import annotations
 import os
 from typing import Any
 
+# 2026-09-22 產品化 Phase 1.1：STYLE_MAP 原本第一個選項寫死
+# 「阿嘉在地風」，描述文字裡也直接寫「阿嘉本人」——HouseFlow 已經是要
+# 給其他房仲使用的通用商業軟體，風格描述不應該綁死開發時測試帳號的
+# 名字。改成通用的「在地親切風」，語氣描述本身保留（在地、親切、口語
+# 自然），只是不再指名道姓。
 class AIService:
     STYLE_MAP = {
-        "阿嘉在地風": "在地、親切、口語自然、直接講重點，像龍潭在地房仲阿嘉本人說話",
+        "在地親切風": "在地、親切、口語自然、直接講重點，像熟悉當地的房仲本人說話",
         "專業分析": "理性、專業、清楚分析房產條件與適合客群",
         "精簡有力": "短句、強勾子、快速抓重點，避免冗長",
         "生活感": "描述實際居住情境、生活機能與家庭使用感受",
@@ -38,7 +43,14 @@ class AIService:
         platform: str,
         style: str,
         extra: str = "",
+        brand_profile: dict[str, Any] | None = None,
     ) -> str:
+        """brand_profile 對應 app.services.brand_profile.load_profile() 的
+        回傳值（display_name / brand_slogan / default_cta /
+        default_hashtags…）——呼叫端（app/pages/ai_center.py）負責從目前
+        使用者在設定頁填寫的資料組出這個 dict，AIService 本身不寫死任何
+        特定使用者的姓名或地區（見 2026-09-22 產品化 Phase 1.1）。
+        """
         property_text = self._build_property_text(property_data)
         style_description = self.STYLE_MAP.get(style, style)
 
@@ -56,6 +68,7 @@ class AIService:
             property_text=property_text,
             style_description=style_description,
             extra=extra,
+            brand_profile=brand_profile,
         )
 
         response = self.client.responses.create(
@@ -70,6 +83,39 @@ class AIService:
             raise RuntimeError("AI 沒有回傳文案，請稍後再試。")
 
         return content
+
+    @staticmethod
+    def _build_brand_block(brand_profile: dict[str, Any] | None) -> str:
+        """組出「固定品牌資訊」區塊，內容完全來自使用者在設定頁填寫的
+        資料（app.services.brand_profile.load_profile()），不寫死任何
+        特定使用者的姓名、地區或 Hashtag。使用者還沒填寫時，明確告訴
+        AI 不要自己捏造姓名或地區，而不是留下一個看起來很正式、實際上
+        是假資料的區塊。
+        """
+        profile = brand_profile or {}
+        display_name = str(profile.get("display_name", "") or "").strip()
+        slogan = str(profile.get("brand_slogan", "") or profile.get("service_area", "") or "").strip()
+        cta = str(profile.get("default_cta", "") or "").strip() or "想了解更多，歡迎私訊，我帶你實際看看。"
+        hashtags = str(profile.get("default_hashtags", "") or "").strip()
+
+        lines = []
+        if display_name:
+            lines.append(f"姓名／品牌名稱：{display_name}")
+        if slogan:
+            lines.append(f"品牌定位／服務區域：{slogan}")
+        lines.append(f"常用結尾：{cta}")
+        if hashtags:
+            lines.append(f"常用 Hashtag：{hashtags}")
+
+        if not display_name and not slogan and not hashtags:
+            return (
+                "固定品牌資訊：\n"
+                "（使用者尚未在設定頁填寫品牌資訊，請不要自行捏造姓名、公司或地區，"
+                "只根據上方物件資料撰寫文案，結尾可使用下面這句通用行動呼籲。）\n"
+                f"常用結尾：{cta}"
+            )
+
+        return "固定品牌資訊：\n" + "\n".join(lines)
 
     def _build_property_text(
         self,
@@ -101,7 +147,10 @@ class AIService:
         property_text: str,
         style_description: str,
         extra: str,
+        brand_profile: dict[str, Any] | None = None,
     ) -> str:
+        brand_block = self._build_brand_block(brand_profile)
+
         common = f"""
 請根據以下真實物件資料撰寫內容：
 
@@ -113,11 +162,7 @@ class AIService:
 使用者補充要求：
 {extra or "無"}
 
-固定品牌資訊：
-姓名：阿嘉
-品牌定位：龍潭成交策略
-常用結尾：想了解更多，歡迎私訊，我帶你實際看看。
-常用 Hashtag：#不動產買賣找阿嘉 #龍潭成交策略
+{brand_block}
 """.strip()
 
         platform_rules = {
