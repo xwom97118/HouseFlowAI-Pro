@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import timedelta
 
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from server.app.models.license import DeviceBinding, License
@@ -222,12 +222,16 @@ def search_licenses(db: Session, query: str = "", status: str = "", limit: int =
 
     q = db.query(License)
     if query:
-        like = f"%{query}%"
+        # SQLite 的 LIKE 對 ASCII 預設不分大小寫，PostgreSQL 的 LIKE
+        # 是區分大小寫的（要不分大小寫得用 ILIKE）——用 func.lower()
+        # 兩邊都轉小寫比對，讓搜尋行為在兩種資料庫下一致，不會出現
+        # 「本機開發搜得到、部署到 PostgreSQL 後搜不到」的落差。
+        like = f"%{query.lower()}%"
         q = q.outerjoin(DeviceBinding, DeviceBinding.license_pk == License.id).filter(
             or_(
-                License.license_id.like(like),
-                License.license_key_last4.like(like),
-                DeviceBinding.device_name.like(like),
+                func.lower(License.license_id).like(like),
+                func.lower(License.license_key_last4).like(like),
+                func.lower(DeviceBinding.device_name).like(like),
             )
         ).distinct()
 

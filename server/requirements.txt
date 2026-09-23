@@ -1,6 +1,25 @@
-fastapi>=0.115,<1
-uvicorn[standard]>=0.32,<1
-sqlalchemy>=2.0,<3
-jinja2>=3.1,<4
-python-multipart>=0.0.9,<1
-httpx>=0.27,<1
+# HouseFlow License Server dependencies (2026-09-23 Phase 3A).
+#
+# Pinned to exact versions (not ranges) so a Render build installs the
+# exact same set of packages that was tested locally - "works on my
+# machine, breaks on Render's build" is exactly the failure mode this
+# file exists to prevent (see docs/PHASE3B_DEPLOY_CHECKLIST.md item on
+# verifying a clean-room `pip install -r server/requirements.txt`
+# before the first real deploy).
+#
+# To upgrade a dependency deliberately: bump the version here, run the
+# full server + desktop test suite locally, then commit.
+
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+sqlalchemy==2.0.54
+alembic==1.20.0
+jinja2==3.1.6
+python-multipart==0.0.32
+httpx==0.28.1
+cryptography==43.0.3
+
+# PostgreSQL driver for production. psycopg (v3) with the binary wheel
+# extra - no separate C toolchain / libpq headers required at build
+# time, which matters for a from-scratch Render build.
+psycopg[binary]==3.3.6

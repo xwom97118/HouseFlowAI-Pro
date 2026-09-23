@@ -4,6 +4,7 @@
 <div class="panel" style="max-width:480px;">
   <h2>全域商業設定</h2>
   <form method="post" action="/admin/settings">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="field">
       <label>目前月費（NT$）</label>
       <input type="number" name="current_monthly_price" value="{{ settings.current_monthly_price }}" min="0" required>

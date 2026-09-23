@@ -26,6 +26,7 @@ class LiveTestServer:
     db_path: str
     _server: uvicorn.Server
     _thread: threading.Thread
+    _prior_skip_flag: str | None = None
 
     @property
     def base_url(self) -> str:
@@ -38,6 +39,13 @@ class LiveTestServer:
         self._server.should_exit = True
         self._thread.join(timeout=10)
         app.dependency_overrides.pop(get_db, None)
+
+        import os
+
+        if self._prior_skip_flag is None:
+            os.environ.pop("HOUSEFLOW_LICENSE_SKIP_STARTUP_DB_INIT", None)
+        else:
+            os.environ["HOUSEFLOW_LICENSE_SKIP_STARTUP_DB_INIT"] = self._prior_skip_flag
 
 
 def start_live_test_server(host: str = "127.0.0.1", port: int = 8799, db_path: str | None = None) -> LiveTestServer:
@@ -62,6 +70,14 @@ def start_live_test_server(host: str = "127.0.0.1", port: int = 8799, db_path: s
 
     app.dependency_overrides[get_db] = override_get_db
 
+    # 這裡已經自己手動呼叫 init_db(engine) 把暫存資料庫建好了——不要讓
+    # main.py 的 startup event 又對模組層級的預設 engine（跟這裡的
+    # engine 是兩個不同的物件）跑一次 init_db()/run_migrations()，
+    # 那樣只會創出一個不相干、空的 server/data/license_server.db
+    # （見 config.py Settings.skip_startup_db_init 的說明）。
+    prior_skip_flag = os.environ.get("HOUSEFLOW_LICENSE_SKIP_STARTUP_DB_INIT")
+    os.environ["HOUSEFLOW_LICENSE_SKIP_STARTUP_DB_INIT"] = "1"
+
     config = uvicorn.Config(app, host=host, port=port, log_level="warning")
     server = uvicorn.Server(config)
     thread = threading.Thread(target=server.run, daemon=True)
@@ -73,4 +89,7 @@ def start_live_test_server(host: str = "127.0.0.1", port: int = 8799, db_path: s
     if not server.started:
         raise RuntimeError("uvicorn test server did not start within 10 seconds")
 
-    return LiveTestServer(host=host, port=port, session_factory=session_factory, db_path=db_path, _server=server, _thread=thread)
+    return LiveTestServer(
+        host=host, port=port, session_factory=session_factory, db_path=db_path,
+        _server=server, _thread=thread, _prior_skip_flag=prior_skip_flag,
+    )

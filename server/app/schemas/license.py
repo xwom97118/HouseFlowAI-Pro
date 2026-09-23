@@ -46,6 +46,7 @@ class LicenseStateResponse(BaseModel):
     server_time: datetime
     minimum_supported_version: str
     latest_version: str
+    signature: str = ""
 
     @classmethod
     def from_result(cls, result: LicenseStateResult, minimum_supported_version: str, latest_version: str) -> "LicenseStateResponse":
@@ -64,6 +65,7 @@ class LicenseStateResponse(BaseModel):
             server_time=result.server_time,
             minimum_supported_version=minimum_supported_version,
             latest_version=latest_version,
+            signature=result.signature,
         )
 
 

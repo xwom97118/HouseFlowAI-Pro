@@ -1,0 +1,75 @@
+# HouseFlow License Server — Render deployment blueprint (Phase 3A).
+#
+# This file describes the intended Render deployment; it is NOT
+# executed by this round of work. No Render account, service, or
+# database has been created from this file. Phase 3B is the human,
+# manual step that actually creates these resources on Render's
+# dashboard (or via `render blueprint launch`) and fills in real
+# secret values - see docs/RENDER_DEPLOYMENT.md for the step-by-step
+# walkthrough, and docs/PHASE3B_DEPLOY_CHECKLIST.md for what must be
+# done by hand before going live.
+#
+# No secret VALUES live in this file - only the NAMES of the
+# environment variables the service needs. Real values are entered
+# once, by hand, in Render's dashboard (or `render env set`) and are
+# never committed to this repository.
+
+services:
+  - type: web
+    name: houseflow-license-server
+    runtime: python
+    region: singapore # pick whichever Render region is closest to your users; change before first deploy
+    plan: starter # Render's smallest paid plan; the free plan works too for initial testing but sleeps when idle
+    branch: main
+    rootDir: server
+
+    buildCommand: "pip install -r requirements.txt"
+
+    # Runs the pending Alembic migrations before the web process
+    # starts serving traffic. Safe to run on every deploy - it's a
+    # no-op when the database is already at head (see
+    # server/app/database.py run_migrations()).
+    preDeployCommand: "python run_migrations.py"
+
+    # $PORT is injected by Render at runtime; --host 0.0.0.0 is
+    # required so Render's load balancer can reach the process. No
+    # --reload in production.
+    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+
+    healthCheckPath: /health
+
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+
+      # Render auto-populates this when you link the houseflow-license-db
+      # database below (Dashboard -> this service -> Environment ->
+      # "Add from database"). Do not set a literal value here.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: houseflow-license-db
+          property: connectionString
+
+      # The rest are secrets with NO default - Render will prompt for
+      # a value when this blueprint is applied, or you set them by
+      # hand afterward under this service's Environment tab. See
+      # docs/PRODUCTION_ENVIRONMENT.md for what each one is and how to
+      # generate it.
+      - key: HOUSEFLOW_SECRET_KEY
+        sync: false
+      - key: HOUSEFLOW_LICENSE_SIGNING_PRIVATE_KEY
+        sync: false
+      - key: HOUSEFLOW_LICENSE_REQUIRE_HTTPS
+        value: "1"
+      - key: APP_BASE_URL
+        sync: false # set once the real Admin URL/domain is known (Phase 3B)
+      - key: LOG_LEVEL
+        value: INFO
+      - key: HOUSEFLOW_ADMIN_SESSION_TTL_HOURS
+        value: "12"
+
+databases:
+  - name: houseflow-license-db
+    databaseName: houseflow_license
+    plan: starter
+    region: singapore # must match the web service's region

@@ -38,6 +38,7 @@ from app.services.license.service import (
     LicenseService,
     TrialAlreadyUsedError,
 )
+from app.services.license.signing import is_signature_verification_enabled, verify_license_state_signature
 from app.version import APP_VERSION
 
 _KEY_PREFIX = "license_"
@@ -48,6 +49,31 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_TIMEOUT_SECONDS = 5.0
 
 _CONNECTION_ERROR_MESSAGE = "無法連線到 HouseFlow License Server，請檢查網路連線後再試一次。"
+_TAMPERED_MESSAGE = "偵測到本機授權資料可能已被竄改，請重新連線驗證授權。"
+_SIGNATURE_INVALID_MESSAGE = "收到的授權狀態簽章驗證失敗，可能遭到竄改或中間人攻擊，請重新連線驗證。"
+
+_LOCALHOST_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_https_or_localhost(base_url: str) -> bool:
+    """規格第 19 節：正式的 License Server URL 必須是 HTTPS，只有
+    localhost（本機開發）允許 HTTP——不然 License Key／授權狀態會用
+    明文透過 Internet 傳輸。用簡單的字串解析而不是引入完整的 URL
+    parsing 套件，這裡只需要判斷 scheme 跟 host 兩件事。
+    """
+    from urllib.parse import urlparse
+
+    parsed = urlparse(base_url)
+    if parsed.scheme == "https":
+        return True
+    if parsed.scheme == "http" and parsed.hostname in _LOCALHOST_HOSTS:
+        return True
+    return False
+
+
+class InsecureLicenseServerURLError(LicenseError):
+    """base_url 既不是 HTTPS、也不是 localhost——拒絕建立 provider，
+    避免不小心把 License Key 用明文 HTTP 傳到 Internet 上。"""
 
 
 class HTTPLicenseProvider(LicenseService):
@@ -61,6 +87,12 @@ class HTTPLicenseProvider(LicenseService):
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
         client_factory: Callable[[], httpx.Client] | None = None,
     ) -> None:
+        if not _is_https_or_localhost(base_url):
+            raise InsecureLicenseServerURLError(
+                f"License Server 網址「{base_url}」不是 HTTPS，也不是本機開發用的 localhost，"
+                "為了避免 License Key 以明文透過 Internet 傳輸，拒絕使用這個網址。"
+            )
+
         self._get_setting = get_setting
         self._set_setting = set_setting
         self._base_url = base_url.rstrip("/")
@@ -118,6 +150,24 @@ class HTTPLicenseProvider(LicenseService):
         self._set_setting(f"{_KEY_PREFIX}last_verified_at", now.isoformat())
 
     def _cache_server_response(self, data: dict) -> None:
+        """把 server 回應快取到本機之前，先驗證簽章（如果這個環境有
+        設定 HOUSEFLOW_LICENSE_SERVER_PUBLIC_KEY）——簽章驗證失敗代表
+        這份「server 回應」本身不可信（可能被竄改／中間人攻擊），
+        直接拒絕快取，拋出例外讓呼叫端知道這次操作沒有成功，而不是
+        悄悄存下一份不可信的資料。
+        """
+        if is_signature_verification_enabled():
+            valid = verify_license_state_signature(
+                license_id=data.get("license_id") or "",
+                status=data.get("status") or "",
+                expires_at=data.get("expires_at") or "",
+                trial_ends_at=data.get("trial_ends_at") or "",
+                server_time=data.get("server_time") or "",
+                signature_b64=data.get("signature") or "",
+            )
+            if not valid:
+                raise LicenseError(_SIGNATURE_INVALID_MESSAGE)
+
         now = self._now()
         state = {
             "license_id": data.get("license_id"),
@@ -128,6 +178,10 @@ class HTTPLicenseProvider(LicenseService):
             "currency": data.get("currency", "TWD"),
             "trial_ends_at": data.get("trial_ends_at"),
             "expires_at": data.get("expires_at"),
+            # 簽章覆蓋的欄位快照本身也要原封不動存起來，離線時才能對
+            # 「快取內容」重新驗證同一份簽章（見 _offline_fallback()）。
+            "server_time": data.get("server_time"),
+            "signature": data.get("signature") or "",
         }
         self._save_state(state)
         self._set_last_verified_at(now)
@@ -210,7 +264,7 @@ class HTTPLicenseProvider(LicenseService):
         except LicenseError:
             # _post 只在 5xx 或連線失敗時才會拋 LicenseError；兩者都
             # 代表「這次連不上／server 出狀況」，退回離線寬限期判斷。
-            return self._offline_fallback(license_, now)
+            return self._offline_fallback(license_, now, state)
 
         status_code = result["status_code"]
         body = result["body"]
@@ -222,15 +276,38 @@ class HTTPLicenseProvider(LicenseService):
                 license_.status, body.get("detail", "這台裝置未跟這組授權綁定，請重新啟用。")
             )
         if status_code >= 400:
-            return self._offline_fallback(license_, now)
+            return self._offline_fallback(license_, now, state)
 
-        self._cache_server_response(body)
+        try:
+            self._cache_server_response(body)
+        except LicenseError as exc:
+            # 剛連上 server、拿到回應，卻驗證不過簽章——這比單純連不上
+            # 嚴重（代表回應內容本身可疑），不應該假裝成「離線」退回
+            # 寬限期判斷，而是直接明確拒絕。
+            return LicenseCheckResult.blocked(license_.status, str(exc))
         return self._result_from_server_body(body, now)
 
     # ------------------------------------------------------------------
 
-    def _offline_fallback(self, license_: License, now: datetime) -> LicenseCheckResult:
+    def _offline_fallback(self, license_: License, now: datetime, state: dict | None) -> LicenseCheckResult:
         self._update_high_water_mark(now)
+
+        if is_signature_verification_enabled() and state is not None:
+            valid = verify_license_state_signature(
+                license_id=state.get("license_id") or "",
+                status=state.get("status") or "",
+                expires_at=state.get("expires_at") or "",
+                trial_ends_at=state.get("trial_ends_at") or "",
+                server_time=state.get("server_time") or "",
+                signature_b64=state.get("signature") or "",
+            )
+            if not valid:
+                # 本機快取的內容跟它自己存的簽章對不上——代表快取被
+                # 竄改過（或者是簽章驗證功能剛啟用、快取還是舊版沒有
+                # 簽章的資料，兩種情況都應該一視同仁，要求重新連線
+                # 驗證，不能直接信任裡面的 expires_at/status）。
+                return LicenseCheckResult.blocked(LicenseStatus.EXPIRED, _TAMPERED_MESSAGE)
+
         return evaluate_license(
             license_,
             now=now,

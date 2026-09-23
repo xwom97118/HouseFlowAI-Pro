@@ -35,14 +35,37 @@ def create_admin_user(db: Session, username: str, password: str) -> AdminUser:
     return admin
 
 
+MAX_FAILED_LOGIN_ATTEMPTS = 5
+LOCKOUT_DURATION_MINUTES = 15
+
+
 def authenticate(db: Session, username: str, password: str) -> AdminUser:
+    """規格第 10 節：基本 brute-force 防護——連續 5 次密碼錯誤後鎖定
+    這個帳號 15 分鐘，即使之後輸入正確密碼也拒絕，直到鎖定時間過去。
+    刻意不區分「帳號不存在」跟「密碼錯誤」的錯誤訊息（都回同一句
+    「帳號或密碼不正確」），避免讓攻擊者用錯誤訊息的差異去列舉出
+    哪些帳號存在。
+    """
+    generic_error = "帳號或密碼不正確。"
     admin = db.query(AdminUser).filter_by(username=username.strip()).first()
     if admin is None or not admin.is_active:
-        raise AdminAuthError("帳號或密碼不正確。")
-    if not verify_password(password, admin.password_hash):
-        raise AdminAuthError("帳號或密碼不正確。")
+        raise AdminAuthError(generic_error)
 
-    admin.last_login_at = utc_now()
+    now = utc_now()
+    if admin.locked_until is not None and admin.locked_until > now:
+        raise AdminAuthError("這個帳號因為多次登入失敗已被暫時鎖定，請稍後再試。")
+
+    if not verify_password(password, admin.password_hash):
+        admin.failed_login_count += 1
+        if admin.failed_login_count >= MAX_FAILED_LOGIN_ATTEMPTS:
+            admin.locked_until = now + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+            admin.failed_login_count = 0
+        db.commit()
+        raise AdminAuthError(generic_error)
+
+    admin.failed_login_count = 0
+    admin.locked_until = None
+    admin.last_login_at = now
     db.commit()
     return admin
 

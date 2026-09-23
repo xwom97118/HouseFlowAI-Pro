@@ -1,4 +1,5 @@
-"""HouseFlow Admin 網頁介面（2026-09-22 Phase 2，規格第 15～19 節）。
+"""HouseFlow Admin 網頁介面（2026-09-22 Phase 2，2026-09-23 Phase 3A
+補強：CSRF、登入 rate limit）。
 
 刻意用 server-rendered Jinja2 頁面＋一般 HTML form（不是 SPA），
 Phase 2 的目標是「必須實際可用」而不是「漂亮到 production marketing
@@ -7,6 +8,11 @@ site」，避免多引入一整套前端框架/建置流程。
 每一個會改變 License/Device/Settings 狀態的 route，都透過
 server/app/services/ 底下的函式操作（帶入 admin.username 供稽核紀錄
 使用），這個檔案本身不直接寫任何 SQLAlchemy 寫入邏輯。
+
+所有會修改資料的 POST route 都要求一個跟目前 session 綁定的
+csrf_token（見 server/app/csrf.py）——`require_admin_and_csrf()` 一次
+處理「有沒有登入」+「CSRF token 對不對」，驗證失敗一律導回登入頁，
+不區分兩種失敗原因（避免洩漏 session 存在與否的資訊）。
 """
 from __future__ import annotations
 
@@ -18,8 +24,15 @@ from fastapi.responses import RedirectResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
-from server.app.admin_ui.auth import clear_session_cookie, require_admin, set_session_cookie
+from server.app.admin_ui.auth import (
+    clear_session_cookie,
+    csrf_token_for,
+    require_admin,
+    require_admin_and_csrf,
+    set_session_cookie,
+)
 from server.app.database import get_db
+from server.app.middleware import admin_login_rate_limiter
 from server.app.models.license import DeviceBinding, License
 from server.app.services import admin_license_service, audit_service
 from server.app.services.admin_auth_service import authenticate, create_session, invalidate_session
@@ -31,6 +44,14 @@ router = APIRouter(prefix="/admin", tags=["admin-ui"])
 
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+
+
+def _ctx(request: Request, **extra) -> dict:
+    """共用的 template context 組合——自動帶入這個 request 對應的
+    csrf_token，避免每個 route 都要手動加一行。"""
+    base = {"csrf_token": csrf_token_for(request)}
+    base.update(extra)
+    return base
 
 
 # ---------------------------------------------------------------------------
@@ -51,6 +72,13 @@ def login_submit(
     next: str = "/admin/",
     db: Session = Depends(get_db),
 ):
+    # 規格第 10 節：基本 brute-force 防護，除了 admin_auth_service 裡
+    # 「單一帳號連續失敗鎖定」，這裡再加一層「單一來源 IP 短時間內
+    # 大量嘗試不同帳號」的防護——兩者互補，各自防不同的攻擊模式。
+    client_ip = request.client.host if request.client else "unknown"
+    if not admin_login_rate_limiter.allow(client_ip):
+        return RedirectResponse(url="/admin/login?err=嘗試次數過多，請稍後再試", status_code=303)
+
     try:
         admin = authenticate(db, username, password)
     except AdminAuthError as exc:
@@ -64,6 +92,9 @@ def login_submit(
 
 @router.get("/logout")
 def logout(request: Request, db: Session = Depends(get_db)):
+    # 登出用 GET 是刻意的：被 CSRF 強制登出頂多是騷擾（使用者要重新
+    # 登入一次），不是真正的安全風險，不需要為了這個低風險動作要求
+    # 使用者一定要透過表單登出。
     token = request.cookies.get("houseflow_admin_session", "")
     invalidate_session(db, token)
     response = RedirectResponse(url="/admin/login", status_code=303)
@@ -84,7 +115,7 @@ def dashboard(request: Request, db: Session = Depends(get_db)):
 
     counts = admin_license_service.dashboard_counts(db)
     return templates.TemplateResponse(
-        request, "dashboard.html", {"admin": admin, "active": "dashboard", "counts": counts}
+        request, "dashboard.html", _ctx(request, admin=admin, active="dashboard", counts=counts)
     )
 
 
@@ -127,7 +158,7 @@ def licenses_list(request: Request, q: str = "", status: str = "", db: Session =
     return templates.TemplateResponse(
         request,
         "licenses_list.html",
-        {"admin": admin, "active": "licenses", "licenses": rows, "query": q, "status_filter": status},
+        _ctx(request, admin=admin, active="licenses", licenses=rows, query=q, status_filter=status),
     )
 
 
@@ -142,20 +173,21 @@ def license_new_page(request: Request, db: Session = Depends(get_db)):
     if isinstance(admin, RedirectResponse):
         return admin
     return templates.TemplateResponse(
-        request, "license_new.html", {"admin": admin, "active": "new", "created_key": None}
+        request, "license_new.html", _ctx(request, admin=admin, active="new", created_key=None)
     )
 
 
 @router.post("/licenses/new")
 def license_new_submit(
     request: Request,
+    csrf_token: str = Form(...),
     plan: str = Form("professional"),
     duration_days: int = Form(30),
     device_limit: int = Form(1),
     is_early_bird: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    admin = require_admin(request, db)
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
 
@@ -170,12 +202,13 @@ def license_new_submit(
     return templates.TemplateResponse(
         request,
         "license_new.html",
-        {
-            "admin": admin,
-            "active": "new",
-            "created_key": result.plaintext_key,
-            "created_license_id": result.license.license_id,
-        },
+        _ctx(
+            request,
+            admin=admin,
+            active="new",
+            created_key=result.plaintext_key,
+            created_license_id=result.license.license_id,
+        ),
     )
 
 
@@ -184,7 +217,7 @@ def license_new_submit(
 # ---------------------------------------------------------------------------
 
 
-def _load_detail_context(db: Session, admin, license_id: str) -> dict:
+def _load_detail_context(request: Request, db: Session, admin, license_id: str) -> dict:
     license_row = db.query(License).filter_by(license_id=license_id).first()
     if license_row is None:
         raise LicenseNotFoundError(license_id)
@@ -195,11 +228,12 @@ def _load_detail_context(db: Session, admin, license_id: str) -> dict:
         .all()
     )
     audit_entries = audit_service.list_for_license(db, license_id)
-    return {
-        "admin": admin, "active": "licenses", "license": license_row,
-        "devices": devices, "audit_entries": audit_entries,
-        "effective_status": compute_effective_status(license_row),
-    }
+    return _ctx(
+        request,
+        admin=admin, active="licenses", license=license_row,
+        devices=devices, audit_entries=audit_entries,
+        effective_status=compute_effective_status(license_row),
+    )
 
 
 @router.get("/licenses/{license_id}")
@@ -208,15 +242,17 @@ def license_detail(request: Request, license_id: str, db: Session = Depends(get_
     if isinstance(admin, RedirectResponse):
         return admin
     try:
-        context = _load_detail_context(db, admin, license_id)
+        context = _load_detail_context(request, db, admin, license_id)
     except LicenseNotFoundError:
         return RedirectResponse(url="/admin/licenses?err=找不到這組 License", status_code=303)
     return templates.TemplateResponse(request, "license_detail.html", context)
 
 
 @router.post("/licenses/{license_id}/extend")
-def license_extend(request: Request, license_id: str, days: int = Form(...), db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def license_extend(
+    request: Request, license_id: str, csrf_token: str = Form(...), days: int = Form(...), db: Session = Depends(get_db)
+):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     admin_license_service.extend_license(db, admin.username, license_id, days)
@@ -224,8 +260,8 @@ def license_extend(request: Request, license_id: str, days: int = Form(...), db:
 
 
 @router.post("/licenses/{license_id}/suspend")
-def license_suspend(request: Request, license_id: str, db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def license_suspend(request: Request, license_id: str, csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     admin_license_service.suspend_license(db, admin.username, license_id)
@@ -233,8 +269,8 @@ def license_suspend(request: Request, license_id: str, db: Session = Depends(get
 
 
 @router.post("/licenses/{license_id}/resume")
-def license_resume(request: Request, license_id: str, db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def license_resume(request: Request, license_id: str, csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     admin_license_service.resume_license(db, admin.username, license_id)
@@ -242,8 +278,8 @@ def license_resume(request: Request, license_id: str, db: Session = Depends(get_
 
 
 @router.post("/licenses/{license_id}/revoke")
-def license_revoke(request: Request, license_id: str, db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def license_revoke(request: Request, license_id: str, csrf_token: str = Form(...), db: Session = Depends(get_db)):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     admin_license_service.revoke_license(db, admin.username, license_id)
@@ -251,8 +287,10 @@ def license_revoke(request: Request, license_id: str, db: Session = Depends(get_
 
 
 @router.post("/licenses/{license_id}/early-bird")
-def license_early_bird(request: Request, license_id: str, enabled: str = Form(...), db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def license_early_bird(
+    request: Request, license_id: str, csrf_token: str = Form(...), enabled: str = Form(...), db: Session = Depends(get_db)
+):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     admin_license_service.set_early_bird(db, admin.username, license_id, enabled == "1")
@@ -260,8 +298,10 @@ def license_early_bird(request: Request, license_id: str, enabled: str = Form(..
 
 
 @router.post("/licenses/{license_id}/set-expiration")
-def license_set_expiration(request: Request, license_id: str, expires_at: str = Form(...), db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def license_set_expiration(
+    request: Request, license_id: str, csrf_token: str = Form(...), expires_at: str = Form(...), db: Session = Depends(get_db)
+):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     try:
@@ -273,8 +313,10 @@ def license_set_expiration(request: Request, license_id: str, expires_at: str = 
 
 
 @router.post("/licenses/{license_id}/devices/{device_id}/deactivate")
-def device_deactivate(request: Request, license_id: str, device_id: str, db: Session = Depends(get_db)):
-    admin = require_admin(request, db)
+def device_deactivate(
+    request: Request, license_id: str, device_id: str, csrf_token: str = Form(...), db: Session = Depends(get_db)
+):
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
     admin_license_service.deactivate_device(db, admin.username, license_id, device_id)
@@ -292,7 +334,7 @@ def audit_log_page(request: Request, db: Session = Depends(get_db)):
     if isinstance(admin, RedirectResponse):
         return admin
     entries = audit_service.list_recent(db)
-    return templates.TemplateResponse(request, "audit.html", {"admin": admin, "active": "audit", "entries": entries})
+    return templates.TemplateResponse(request, "audit.html", _ctx(request, admin=admin, active="audit", entries=entries))
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +348,15 @@ def settings_page(request: Request, db: Session = Depends(get_db)):
     if isinstance(admin, RedirectResponse):
         return admin
     settings = get_product_settings(db)
-    return templates.TemplateResponse(request, "settings.html", {"admin": admin, "active": "settings", "settings": settings})
+    return templates.TemplateResponse(
+        request, "settings.html", _ctx(request, admin=admin, active="settings", settings=settings)
+    )
 
 
 @router.post("/settings")
 def settings_submit(
     request: Request,
+    csrf_token: str = Form(...),
     current_monthly_price: int = Form(...),
     currency: str = Form(...),
     trial_days: int = Form(...),
@@ -320,7 +365,7 @@ def settings_submit(
     minimum_supported_version: str = Form(...),
     db: Session = Depends(get_db),
 ):
-    admin = require_admin(request, db)
+    admin = require_admin_and_csrf(request, db, csrf_token)
     if isinstance(admin, RedirectResponse):
         return admin
 
@@ -330,6 +375,12 @@ def settings_submit(
         "offline_grace_days": old.offline_grace_days, "latest_version": old.latest_version,
         "minimum_supported_version": old.minimum_supported_version,
     }
+    # 規格第 23 節：全域漲價不能動到已經鎖定的 Early Bird 價格——
+    # update_product_settings() 只改 ProductSettings 這張表，
+    # License.locked_price 是每一組 License 各自獨立的欄位，兩者完全
+    # 沒有關聯，所以這裡不需要、也不會去動任何一組 License 的
+    # locked_price（已經由 test_pricing.py 的
+    # test_global_price_change_does_not_affect_early_bird 驗證過）。
     update_product_settings(
         db,
         current_monthly_price=current_monthly_price,

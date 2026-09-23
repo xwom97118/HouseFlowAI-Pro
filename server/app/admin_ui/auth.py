@@ -11,6 +11,7 @@ from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
 
 from server.app.config import get_settings
+from server.app.csrf import generate_csrf_token, verify_csrf_token
 from server.app.models.license import AdminUser
 from server.app.services.admin_auth_service import resolve_session
 
@@ -33,8 +34,12 @@ def clear_session_cookie(response) -> None:
     response.delete_cookie(SESSION_COOKIE_NAME)
 
 
+def get_session_token(request: Request) -> str:
+    return request.cookies.get(SESSION_COOKIE_NAME, "")
+
+
 def get_current_admin(request: Request, db: Session) -> AdminUser | None:
-    token = request.cookies.get(SESSION_COOKIE_NAME, "")
+    token = get_session_token(request)
     return resolve_session(db, token)
 
 
@@ -48,4 +53,26 @@ def require_admin(request: Request, db: Session) -> AdminUser | RedirectResponse
     if admin is None:
         next_path = request.url.path
         return RedirectResponse(url=f"/admin/login?next={next_path}", status_code=303)
+    return admin
+
+
+def csrf_token_for(request: Request) -> str:
+    """給 GET route 渲染表單時用——把這個值放進 hidden input，POST 時
+    用 require_admin_and_csrf() 驗證。"""
+    return generate_csrf_token(get_session_token(request))
+
+
+def require_admin_and_csrf(request: Request, db: Session, submitted_csrf_token: str) -> AdminUser | RedirectResponse:
+    """POST route 專用：先確認有登入，再驗證 CSRF token 是否跟目前
+    session 對得上。CSRF 驗證失敗一律當成「沒有有效 session」處理
+    （導回登入頁），不特別回傳「CSRF 錯誤」的訊息給呼叫端——這樣不會
+    洩漏「你的 session 存在，只是 CSRF token 不對」這種對攻擊者有用
+    的資訊。
+    """
+    admin = require_admin(request, db)
+    if isinstance(admin, RedirectResponse):
+        return admin
+    session_token = get_session_token(request)
+    if not verify_csrf_token(session_token, submitted_csrf_token):
+        return RedirectResponse(url="/admin/login?err=請重新登入後再試一次", status_code=303)
     return admin

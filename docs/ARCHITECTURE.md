@@ -6,12 +6,29 @@
 
 ## 1. 整體分層
 
+Phase 3A（2026-09-23）目標部署形態（**尚未部署**，見
+[RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md)）：
+
+```
+HouseFlow Desktop
+        │
+      HTTPS
+        ▼
+Render Web Service
+FastAPI License Server + Admin
+        │
+        ▼
+Render PostgreSQL
+```
+
+程式碼層的實際分層：
+
 ```
 ┌─────────────────────────────────────────────────────────┐
 │  HouseFlow Desktop (PySide6)                              │
 │  app/main_window.py, app/pages/*, app/widgets/*           │
 │                     │                                      │
-│                     │ HTTPS（Phase 2 本機開發：HTTP）         │
+│                     │ HTTPS（本機開發允許 HTTP，見規格第 19 節） │
 │                     ▼                                      │
 │           License Server (FastAPI)  ◄──────┐               │
 │           server/app/api/license_routes.py │               │
@@ -108,6 +125,46 @@ Desktop 端**正式**的 `LicenseService` 實作，用 `httpx` 呼叫本機／�
 License Server 本身見 [LICENSE_SERVER.md](LICENSE_SERVER.md)、
 [ADMIN_CONTROL_PLANE.md](ADMIN_CONTROL_PLANE.md)、
 [LICENSE_SECURITY.md](LICENSE_SECURITY.md)。
+
+### 3.1 Phase 3A：Cloud Readiness 補強
+
+這一輪沒有改變第 3 節描述的整體架構，是把 License Server 補強成
+「可以安全部署到正式 Cloud」的狀態：
+
+- **Migration**：`server/migrations/`（Alembic），
+  `server/app/database.py` 的 `run_migrations()`。正式環境
+  （`ENVIRONMENT=production`）啟動時執行這個，不是
+  `Base.metadata.create_all()`——見
+  [LICENSE_SERVER.md](LICENSE_SERVER.md) 的「資料庫選擇」一節。
+- **License 狀態簽章**：`server/app/services/signing_service.py`
+  （Ed25519 簽章）+ `app/services/license/signing.py`（Desktop 端
+  驗證）。防止使用者直接修改本機 SQLite 快取繞過授權——見
+  [CLOUD_SECURITY.md](CLOUD_SECURITY.md) 第 4 節。
+- **CSRF**：`server/app/csrf.py` + Admin UI 所有 POST route。
+- **Rate limiting**：`server/app/middleware.py`（License API + Admin
+  登入），Phase 3A 是單一 process 記憶體內實作，見
+  [CLOUD_SECURITY.md](CLOUD_SECURITY.md) 第 3 節的已知限制。
+- **登入 brute-force 防護**：`AdminUser.failed_login_count` /
+  `locked_until`（`server/app/services/admin_auth_service.py`）。
+- **結構化 logging + request correlation id**：
+  `server/app/logging_config.py` + `server/app/middleware.py` 的
+  `RequestIDMiddleware`。
+- **全域例外處理**：`server/app/main.py`，不對外洩漏 traceback/SQL/
+  檔案路徑。
+- **Health / Readiness**：`GET /health`（liveness）、
+  `GET /health/ready`（DB 連得上才算 ready）。
+- **Desktop 端 HTTPS 強制**：`HTTPLicenseProvider` 建構時檢查
+  base_url，非 HTTPS 且非 localhost 直接拒絕（見 `http_provider.py`
+  的 `InsecureLicenseServerURLError`）。
+- **PostgreSQL 相容性**：`DATABASE_URL` 環境變數 fallback（Render
+  自動注入的標準名稱）、搜尋查詢改用 `func.lower()` 確保跨資料庫
+  行為一致（SQLite 的 `LIKE` 預設不分大小寫，PostgreSQL 的
+  `LIKE` 區分大小寫）。
+
+這些補強**沒有**部署到任何真正的 Cloud——見
+[RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md)（尚未執行的部署步驟）與
+[PHASE3B_DEPLOY_CHECKLIST.md](PHASE3B_DEPLOY_CHECKLIST.md)（真正上線
+前需要人工完成的事項）。
 
 ## 4. Property Source Connector
 

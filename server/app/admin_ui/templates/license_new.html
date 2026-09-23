@@ -17,6 +17,7 @@
 <div class="panel" style="max-width:480px;">
   <h2>建立新 License</h2>
   <form method="post" action="/admin/licenses/new">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
     <div class="field">
       <label>Plan</label>
       <select name="plan">

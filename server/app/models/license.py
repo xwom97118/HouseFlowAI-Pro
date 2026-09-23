@@ -123,6 +123,13 @@ class AdminUser(Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # 2026-09-23 Phase 3A（規格第 10 節）：登入暴力嘗試防護。
+    # failed_login_count 連續失敗達到門檻時，設定 locked_until，在那
+    # 之前即使密碼正確也拒絕登入——見 admin_auth_service.authenticate()。
+    # 密碼登入成功會把這兩個欄位重置。
+    failed_login_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    locked_until: Mapped[datetime | None] = mapped_column(DateTime(), nullable=True)
+
 
 class AdminSession(Base):
     __tablename__ = "admin_sessions"

@@ -52,6 +52,11 @@ class LicenseStateResult:
     expires_at: datetime | None = None
     offline_valid_until: datetime | None = None
     server_time: datetime = None  # type: ignore[assignment]
+    # 2026-09-23 Phase 3A（規格第 20 節）：Ed25519 簽章，覆蓋
+    # license_id/status/expires_at/trial_ends_at/server_time——Desktop
+    # 端驗證這個簽章之後才信任、才快取這份狀態，離線時重新驗證快取
+    # 內容的簽章，偵測本機資料是否被竄改。見 signing_service.py。
+    signature: str = ""
 
     def __post_init__(self) -> None:
         if self.server_time is None:
@@ -94,6 +99,21 @@ def _effective_price(license_row: License, current_monthly_price: int) -> int:
 
 
 def _compute_status_result(db: Session, license_row: License, device: DeviceBinding | None) -> LicenseStateResult:
+    result = _compute_status_result_unsigned(db, license_row, device)
+
+    from server.app.services.signing_service import sign_license_state
+
+    result.signature = sign_license_state(
+        license_id=result.license_id or "",
+        status=result.status,
+        expires_at=result.expires_at.isoformat() if result.expires_at else "",
+        trial_ends_at=result.trial_ends_at.isoformat() if result.trial_ends_at else "",
+        server_time=result.server_time.isoformat(),
+    )
+    return result
+
+
+def _compute_status_result_unsigned(db: Session, license_row: License, device: DeviceBinding | None) -> LicenseStateResult:
     settings = get_product_settings(db)
     now = utc_now()
     price = _effective_price(license_row, settings.current_monthly_price)

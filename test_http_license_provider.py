@@ -103,7 +103,7 @@ def _asgi_client_factory(session_factory):
 def _make_provider(srv, get_setting, set_setting, now_provider=datetime.now, offline_grace_days=7):
     return HTTPLicenseProvider(
         get_setting, set_setting,
-        base_url="http://testserver",
+        base_url="http://127.0.0.1:8799",
         now_provider=now_provider,
         offline_grace_days=offline_grace_days,
         client_factory=_asgi_client_factory(srv.session_factory),
