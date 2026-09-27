@@ -26,7 +26,7 @@ Desktop 本機（見 [PRODUCT_V1_SPEC.md](PRODUCT_V1_SPEC.md) 第 10 節）。
 | 密碼／Session/License Key 雜湊 | Python 標準函式庫（`hashlib.scrypt` + `secrets`） | 見 [LICENSE_SECURITY.md](LICENSE_SECURITY.md)——刻意不引入 passlib/PyJWT，用官方推薦的 `secrets` 模組做 cryptographically secure random，用 `hashlib.scrypt`（Python 3.6+ 內建）做記憶體困難的密碼雜湊，減少依賴。 |
 | Admin UI | FastAPI + Jinja2（server-rendered HTML + 一般 form） | Phase 2 的目標是「必須實際可用」，不是「漂亮到 production marketing site」。避免多引入一整套前端框架/建置流程；之後如果要做更豐富的 UI，可以在不動 API/Service 層的前提下換掉這一層。 |
 | Migration | **Phase 3A：Alembic**（`server/migrations/`，`server/app/database.py` 的 `run_migrations()`） | 正式環境（`ENVIRONMENT=production`）啟動時跑 `alembic upgrade head`——有版本記錄，`existing database → upgrade → latest schema` 是安全、可測試的路徑（見 `server/tests/test_lifecycle.py` 的 migration 相關測試）。本機開發預設仍然用 `Base.metadata.create_all()`（`init_db()`）圖方便；測試環境用暫存 SQLite 檔案，兩者都不會跑到 Alembic 那條路徑，不會互相干擾。 |
-| PostgreSQL 驅動 | `psycopg`（v3，`psycopg[binary]`） | 官方推薦的新一代驅動，binary extra 內建預編譯好的 libpq，Render 的 build 環境不需要另外裝系統層級的 PostgreSQL 開發套件。 |
+| PostgreSQL 驅動 | `psycopg2-binary` | `create_db_engine()`／Alembic 的 `env.py` 都把 `DATABASE_URL` 原封不動交給 SQLAlchemy，不做任何 scheme 改寫；Render 提供的是不帶 `+driver` 後綴的裸 `postgresql://` 連線字串，SQLAlchemy 對這個格式預設走的 DBAPI 就是 `psycopg2`（不是 `psycopg` v3，那個需要網址明確寫成 `postgresql+psycopg://`）。第一次正式部署曾經因為裝錯驅動（`psycopg[binary]` v3）而以 `ModuleNotFoundError: No module named 'psycopg2'` 失敗，修正後改用這個驅動，不需要改動 `database.py`/`config.py`/`migrations/env.py` 任何一行。binary extra 內建預編譯好的 libpq，Render 的 build 環境不需要另外裝系統層級的 PostgreSQL 開發套件。 |
 
 ## 3. Repository 結構
 

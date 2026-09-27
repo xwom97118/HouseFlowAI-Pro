@@ -19,7 +19,21 @@ python-multipart==0.0.32
 httpx==0.28.1
 cryptography==43.0.3
 
-# PostgreSQL driver for production. psycopg (v3) with the binary wheel
-# extra - no separate C toolchain / libpq headers required at build
-# time, which matters for a from-scratch Render build.
-psycopg[binary]==3.3.6
+# PostgreSQL driver for production.
+#
+# server/app/database.py's create_db_engine() and
+# server/migrations/env.py's engine_from_config() both pass
+# settings.database_url straight into SQLAlchemy with no scheme
+# rewriting. Render's PostgreSQL DATABASE_URL is a bare
+# "postgresql://..." string (no +driver suffix), and SQLAlchemy's
+# documented default DBAPI for the plain "postgresql" dialect is
+# psycopg2 - not psycopg3, which SQLAlchemy only selects for an
+# explicit "postgresql+psycopg://" URL. An earlier version of this
+# file listed psycopg[binary] (v3) instead, which SQLAlchemy never
+# actually loaded given this URL format, causing the first real Render
+# deploy to fail with `ModuleNotFoundError: No module named
+# 'psycopg2'` the moment create_engine() ran. psycopg2-binary is the
+# correct driver for the URL format actually in use; the binary wheel
+# extra means no separate C toolchain / libpq headers are required at
+# build time.
+psycopg2-binary==2.9.13
