@@ -21,20 +21,34 @@ services:
     region: singapore # pick whichever Render region is closest to your users; change before first deploy
     plan: starter # Render's smallest paid plan; the free plan works too for initial testing but sleeps when idle
     branch: main
-    rootDir: server
-
-    buildCommand: "pip install -r requirements.txt"
+    # No rootDir here - deliberately. Every module under server/app/
+    # imports its siblings with the absolute path `from server.app...
+    # import ...` (not a relative import), which only resolves when
+    # the process's working directory is the REPO ROOT (so `server` is
+    # itself an importable top-level package) - not when Render cd's
+    # into rootDir: server first. This was verified with a clean-room
+    # checkout test (git archive + fresh venv + fresh SQLite db): with
+    # `rootDir: server` and `uvicorn app.main:app`, the process crashes
+    # immediately with `ModuleNotFoundError: No module named 'server'`
+    # the moment app/main.py runs `from server.app.admin_ui.routes
+    # import ...`. Running from the repo root with the commands below
+    # (which all explicitly reference the `server/` subpath) is the
+    # config that was actually proven to work.
+    buildCommand: "pip install -r server/requirements.txt"
 
     # Runs the pending Alembic migrations before the web process
     # starts serving traffic. Safe to run on every deploy - it's a
     # no-op when the database is already at head (see
-    # server/app/database.py run_migrations()).
-    preDeployCommand: "python run_migrations.py"
+    # server/app/database.py run_migrations()). run_migrations.py
+    # inserts the repo root onto sys.path itself, so it works
+    # regardless of the process's working directory.
+    preDeployCommand: "python server/run_migrations.py"
 
     # $PORT is injected by Render at runtime; --host 0.0.0.0 is
     # required so Render's load balancer can reach the process. No
-    # --reload in production.
-    startCommand: "uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    # --reload in production. Must be `server.app.main:app` (not
+    # `app.main:app`) - see the rootDir comment above.
+    startCommand: "uvicorn server.app.main:app --host 0.0.0.0 --port $PORT"
 
     healthCheckPath: /health
 

@@ -3,7 +3,10 @@ __pycache__/
 .venv/
 backups/*.db
 logs/
+*.log
 .env
+.env.*
+!.env.example
 
 data/
 build/
@@ -11,5 +14,18 @@ dist/
 pw-browsers/
 *.db
 *.db-journal
+*.db-wal
+*.db-shm
+*.sqlite3
 *.spec.bak
 HouseFlow_build_log.txt
+
+# 2026-09-28 Phase 3B git audit：明確補強，即使有一天這些內容出現在
+# data/ 以外的位置（例如有人不小心把私鑰存成檔案、或把 Facebook
+# session 資料夾複製到別的路徑），也不會被意外 commit 進去——這是
+# defense-in-depth，不是取代上面已經涵蓋的規則。
+*.pem
+*.key
+facebook_browser_profile/
+*_browser_profile/
+*.session.json

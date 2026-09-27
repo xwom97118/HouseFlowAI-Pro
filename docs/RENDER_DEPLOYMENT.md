@@ -33,11 +33,19 @@ Render Dashboard → New → PostgreSQL。
 Render Dashboard → New → Web Service → 選這個 repository。
 
 - Name：`houseflow-license-server`
-- Root Directory：`server`
+- Root Directory：**留空（repo 根目錄）**——不要設成 `server`。
+  `server/app/` 底下每個模組都用絕對路徑
+  `from server.app.xxx import ...` 互相 import，不是相對 import，
+  只有在 process 的工作目錄是 repo 根目錄（讓 `server` 本身是一個
+  可以被 import 的頂層套件）時才能正確解析；設成 `rootDir: server`
+  會讓 Render 先 `cd` 進 `server/`，`server` 這個套件反而找不到，
+  process 一啟動就會直接 crash（`ModuleNotFoundError: No module
+  named 'server'`）。這是實際用「乾淨 checkout 測試」（`git archive`
+  + 全新 venv + 全新 SQLite）驗證過的結果，不是理論推測。
 - Runtime：Python 3
-- Build Command：`pip install -r requirements.txt`
-- Pre-Deploy Command：`python run_migrations.py`
-- Start Command：`uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+- Build Command：`pip install -r server/requirements.txt`
+- Pre-Deploy Command：`python server/run_migrations.py`
+- Start Command：`uvicorn server.app.main:app --host 0.0.0.0 --port $PORT`
 - Health Check Path：`/health`
 
 （也可以用 `render.yaml` 這個 blueprint 檔案，讓 Render 直接照著建立
@@ -71,11 +79,11 @@ LOG_LEVEL=INFO
 
 儲存環境變數之後 Render 會自動觸發一次部署：
 
-1. `pip install -r requirements.txt`
-2. `python run_migrations.py`（在全新資料庫上會套用所有 migration，
-   建出完整 schema；如果之後又新增了 migration，只會套用還沒套用過
-   的部分）
-3. `uvicorn app.main:app --host 0.0.0.0 --port $PORT`
+1. `pip install -r server/requirements.txt`
+2. `python server/run_migrations.py`（在全新資料庫上會套用所有
+   migration，建出完整 schema；如果之後又新增了 migration，只會套用
+   還沒套用過的部分）
+3. `uvicorn server.app.main:app --host 0.0.0.0 --port $PORT`
 4. Render 打 `/health`，收到 200 才會把流量切過去
 
 ### 6. 建立第一個 Admin 帳號
@@ -83,7 +91,7 @@ LOG_LEVEL=INFO
 Render 的 Shell 分頁（Web Service → Shell）：
 
 ```bash
-python bootstrap_admin.py --username <你的帳號名稱>
+python server/bootstrap_admin.py --username <你的帳號名稱>
 ```
 
 會要求互動輸入密碼（Render Shell 支援互動輸入）。**這一步只做一次**

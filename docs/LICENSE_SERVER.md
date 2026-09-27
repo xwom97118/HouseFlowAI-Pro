@@ -154,7 +154,11 @@ License Server（預設 `http://127.0.0.1:8000`，見
 python server/run_migrations.py
 
 # Start：不加 --reload，讀 Render 注入的 $PORT
-uvicorn app.main:app --host 0.0.0.0 --port $PORT
+# 從 repo 根目錄執行（不是從 server/ 底下）——server/app/ 底下的模組
+# 互相用絕對路徑 `from server.app.xxx import` import，只有在 repo
+# 根目錄是 process 工作目錄時才能正確解析（見 RENDER_DEPLOYMENT.md
+# 的說明，這是用乾淨 checkout 測試實際驗證過的結果）。
+uvicorn server.app.main:app --host 0.0.0.0 --port $PORT
 ```
 
 完整步驟見 [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md)。

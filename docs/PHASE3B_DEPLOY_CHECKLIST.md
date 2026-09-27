@@ -25,7 +25,10 @@
 ## Render 設定（照 [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md) 逐步操作）
 
 - [ ] 建立 PostgreSQL 資料庫（`houseflow-license-db`）。
-- [ ] 建立 Web Service，Root Directory 設成 `server`。
+- [ ] 建立 Web Service，Root Directory **留空**（repo 根目錄，不要設成
+      `server`——見 [RENDER_DEPLOYMENT.md](RENDER_DEPLOYMENT.md) 第 2
+      節，已經用乾淨 checkout 測試驗證過設成 `server` 會讓 process
+      啟動就 crash）。
 - [ ] 連結資料庫到 Web Service（自動注入 `DATABASE_URL`）。
 - [ ] 設定所有必要環境變數（見
       [PRODUCTION_ENVIRONMENT.md](PRODUCTION_ENVIRONMENT.md) 的完整
